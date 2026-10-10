@@ -27,12 +27,20 @@ if(NINTENDO_SWITCH)
         "${NVK_SDK}/lib/libvulkan.a" expat z nx
         "${NVK_SDK}/lib/libvulkan.a" expat z nx stdc++ m)
 else()
+    if(IOS)
+        # iOS: MoltenVK static lib + SDL2 static, supplied by the caller.
+        find_package(SDL2 REQUIRED)
+        target_include_directories(xbox_nv2a_vk PUBLIC "${VULKAN_HEADERS_DIR}")
+        target_link_libraries(xbox_nv2a_vk PUBLIC SDL2::SDL2-static
+            SPIRV-Tools-opt SPIRV-Tools c++)
+    else()
     find_package(Vulkan REQUIRED)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
     # The distribution glslang is built with its optimizer (static SPIRV-Tools).
     target_link_libraries(xbox_nv2a_vk PUBLIC Vulkan::Vulkan PkgConfig::SDL2
         SPIRV-Tools-opt SPIRV-Tools stdc++)
+    endif()
 endif()
 if(NOT MSVC)
     target_compile_options(xbox_nv2a_vk PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -O2)

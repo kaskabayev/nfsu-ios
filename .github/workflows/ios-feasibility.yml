@@ -1,0 +1,34 @@
+name: ios-feasibility
+on: workflow_dispatch
+jobs:
+  runtime:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install cmake ninja pkg-config python3
+      - name: SDL2 (iOS arm64 static)
+        run: |
+          git clone --depth 1 --branch release-2.30.9 https://github.com/libsdl-org/SDL.git /tmp/SDL
+          cmake -S /tmp/SDL -B /tmp/SDL/b -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF -DCMAKE_INSTALL_PREFIX=$HOME/ios-deps
+          cmake --build /tmp/SDL/b && cmake --install /tmp/SDL/b
+      - name: glslang + SPIRV-Tools (iOS arm64 static)
+        run: |
+          git clone --depth 1 --branch 15.1.0 https://github.com/KhronosGroup/glslang.git /tmp/glslang
+          cd /tmp/glslang && python3 update_glslang_sources.py
+          cmake -S . -B b -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DENABLE_OPT=ON -DENABLE_GLSLANG_BINARIES=OFF -DBUILD_EXTERNAL=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/ios-deps
+          cmake --build b && cmake --install b
+          # SPIRV-Tools is built in-tree; install its libs too
+          find b -name 'libSPIRV-Tools*.a' -exec cp {} $HOME/ios-deps/lib/ \;
+      - name: Vulkan headers
+        run: git clone --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers.git $HOME/vkh
+      - name: Configure runtime for iOS
+        run: |
+          cmake -S xboxrecomp -B build-ios -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DXBOXRECOMP_VULKAN=ON -DVULKAN_HEADERS_DIR=$HOME/vkh/include \
+            -DCMAKE_PREFIX_PATH=$HOME/ios-deps -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH 2>&1 | tee cfg.log
+      - name: Build runtime libs
+        run: cmake --build build-ios -k 0 2>&1 | tee build.log | tail -150
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: logs, path: "*.log" }
