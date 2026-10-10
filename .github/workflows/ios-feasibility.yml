@@ -28,7 +28,9 @@ jobs:
             -DXBOXRECOMP_VULKAN=ON -DVULKAN_HEADERS_DIR=$HOME/vkh/include \
             -DCMAKE_PREFIX_PATH=$HOME/ios-deps -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH 2>&1 | tee cfg.log
       - name: Build runtime libs
-        run: cmake --build build-ios -k 0 2>&1 | tee build.log | tail -150
+        run: set -o pipefail; cmake --build build-ios -- -k 0 2>&1 | tee build.log | tail -150
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: logs, path: "*.log" }
+      - name: List built libs
+        run: find build-ios -name '*.a' -o -name '*.o' -name 'xbox_memory_layout*' | head -20
