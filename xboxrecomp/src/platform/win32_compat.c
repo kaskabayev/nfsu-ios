@@ -42,10 +42,22 @@
 #include <sys/mman.h>
 #endif
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
+#if !TARGET_OS_IPHONE
 #include <mach/mach_vm.h>
+#else
+/* iOS SDK ships mach/mach_vm.h behind #error; declare the one call we use. */
+#include <mach/mach_types.h>
+#include <mach/mach_init.h>
+extern kern_return_t mach_vm_map(
+    vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size,
+    mach_vm_offset_t mask, int flags, mem_entry_name_port_t object,
+    memory_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection,
+    vm_prot_t max_protection, vm_inherit_t inheritance);
+#endif
 #elif !defined(__SWITCH__)
 #include <sys/sysinfo.h>
 #endif
@@ -882,6 +894,9 @@ void xbox_guest_pin(int interrupt)
      * interrupt thread goes above it so it pre-empts guest threads. */
     if (interrupt)
         svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    /* iOS has no thread affinity API; keep guest threads unpinned. */
+    (void)core; (void)interrupt;
 #else
     {
         cpu_set_t set;
