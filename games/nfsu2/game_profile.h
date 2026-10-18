@@ -27,8 +27,8 @@
 #define NFSU_IOS_DATA_FOLDERS       { "NFSU2-data", "game", "nfsu2", "NFSU2" }
 
 /* Launch screen and log banner. */
-#define NFSU_BUILD_TAG      "v34"
-#define NFSU_BUILD_NOTE     "v33 + upstream 0.5.13 merged: lifter fixes, present semaphores"
+#define NFSU_BUILD_TAG      "v34b"
+#define NFSU_BUILD_NOTE     "v34 + per-axis snap on iOS, present pacing"
 
 /* The disc this build expects. These values belong to the gen/ the binary was
  * built from (the XBE the lifter read), so they must change together with it:
