@@ -131,7 +131,7 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_GL_FINISH=1` | Wait for the GPU after every operation (finds the call that hangs it). |
 | `RECOMP_FPS_LOG=1` | Presented frames per 10 s. |
 | `RECOMP_VK_CUBE=0` | Vulkan: no cube maps (car reflections off). The in-game Car Reflections row does the same at run time. |
-| `RECOMP_VK_SNAP=1\|0` | Vulkan vertex snap: 1 puts each position where a title edge there would land, per axis; 0 shifts both axes by one constant (the rule before 0.5.13). They differ at render scales of 2 and up. Default 1; 0 on iOS and in NFSU1. |
+| `RECOMP_VK_SNAP=1\|0` | Vulkan vertex snap: 1 puts each position where a title edge there would land, per axis; 0 shifts both axes by one constant (the rule before 0.5.13). They differ at render scales of 2 and up. Default 1; 0 in NFSU1. |
 | `RECOMP_PB_RUN=1\|0` | Take vertex-constant and index runs of the pushbuffer in one loop and skip the per-word survey. Default 1; 0 on iOS and in NFSU1. |
 | `RECOMP_VK_DUMP_ALL=1` | With `RECOMP_GL_DUMP`: dump every surface too, as `<prefix><frame>_<va>.bmp`. |
 | `RECOMP_DRAW_MERGE_STATS=1` | With `RECOMP_DRAW_STATS=1`: also survey draws that match the previous one (hashes every index; slow). |

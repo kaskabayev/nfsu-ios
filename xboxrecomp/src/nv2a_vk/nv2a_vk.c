@@ -4134,18 +4134,16 @@ static int upload_vertices(const Nv2aRawBatch *b)
 /* RECOMP_VK_SNAP=1|0: the vertex shader's nv2a_snap (gl_vsh.c) puts each
  * position where a title edge there would land, per axis (1), or shifts both
  * axes by one constant (0, the rule before the upstream 0.5.13 merge). They
- * differ at render scales of 2 and up. Default on, except on iOS and in
- * NFSU1 (game_profile.h): 0 until compared on the device. */
+ * differ at render scales of 2 and up. Default on, except in NFSU1
+ * (game_profile.h sets 0). On iOS the one-shift rule left black and pink seams
+ * that split the screen into about six rectangles at 2x; per axis removed them
+ * (checked on an iPhone 15 Pro). */
 static int snap_per_axis(void)
 {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("RECOMP_VK_SNAP");
-#ifdef NFSU2_IOS
-        v = e && *e ? *e != '0' : 0;
-#else
         v = e && *e ? *e != '0' : 1;
-#endif
         fprintf(stderr, "[VK] vertex snap: %s\n", v ? "per axis" : "one shift");
     }
     return v;

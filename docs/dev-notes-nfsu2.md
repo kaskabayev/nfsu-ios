@@ -190,7 +190,7 @@ older text below that says `src/recomp_manual.c` means
   each title pixel's first real centre sits on i + 0.5. A/B at 2x: real
   row/column 1 mean 170 vs 30 without, flat with.
   At k >= 2 no constant shift fits every edge (fixed upstream in 0.5.13,
-  VK only; here `RECOMP_VK_SNAP`, off on iOS and in NFSU1): square pixels at 1.5x store 2x columns, and an edge on a whole
+  VK only; here `RECOMP_VK_SNAP`, off in NFSU1): square pixels at 1.5x store 2x columns, and an edge on a whole
   title pixel landed on the centre of the last real column it should cover
   -> the motion blur's 320x240 copies (0x82EBA380/0x82F05400 ring) lost
   their last column, and the blur pulled black in at the right of the
