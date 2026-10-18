@@ -14,7 +14,7 @@ NFSU2 or NFSU1.
 
 **Version**
 The version banner: the line in the log that starts with `build ` (for example
-`build v33 (...)`).
+`build v34 (...)`).
 
 **Device and system**
 - Device (for example iPhone 15 Pro, iPad Pro 13", Linux PC with GPU name, Switch model):

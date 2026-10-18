@@ -2,11 +2,34 @@
 
 Short notes per release of this fork. The upstream Switch and Linux port has
 its own release history in [antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw);
-this tree is based on upstream version 0.5 (commit 6e19726). Version numbers
-below are the fork's build tags.
+this tree is based on upstream version 0.5 (commit 6e19726) and includes
+upstream up to 0.5.13 (commit d3bbc30), except the renderer parts listed under
+"Not yet ported" below. Version numbers below are the fork's build tags.
+
+## Not yet ported (upstream 0.5.12 and 0.5.13, Vulkan renderer)
+
+These upstream changes are in `xboxrecomp/src/nv2a_vk/nv2a_vk.c` upstream. This
+tree keeps its own renderer file and does not have them yet:
+
+- fewer barriers between render passes (`RECOMP_VK_SYNC`), the uniform and
+  descriptor state cache (`RECOMP_VK_STATE_CACHE`), presenting on a worker
+  thread (`RECOMP_VK_ASYNC_PRESENT`);
+- the early-Z shader variant (`RECOMP_VK_NAT`; the shader generator
+  `nv2a_gl_psh_no_alpha_test` is merged, the renderer does not call it);
+- FXAA in the present pass (`RECOMP_VK_FXAA`) and square pixels
+  (`RECOMP_VK_SQUARE`, `RECOMP_GL_SCALE_X`), with the Anti-Aliasing and Square
+  Pixels rows of the Video options (`NFSU2_FXAA_ROWS`);
+- changing the render scale at run time (`rescale_surfaces`): the Resolution
+  Scale row applies at the next start;
+- the texture cache key by pitch, mip levels, format and palette, and the DXT
+  mip levels in the texture hash (upstream 0.5.10);
+- the motion blur edge change for square pixels (0.5.13);
+- upstream's rewrite of the flip interval (`NFSU2_FPS_CAP`, `NFSU2_NIS_CAP`):
+  our swap wrappers keep deciding the 60 fps races and the hot 30 fps cap.
 
 ## NFSU1 (iOS and Linux)
 
+- u1-7: upstream 0.5.13 merged: lifter fixes (flag joins, rounding float to int, D3D to D3D function pointers, split-off stubs); the bulk pushbuffer path and the per-axis vertex snap are off.
 - u1-6: one tree with NFSU2, nfsu1_* file names, original icons.
 - u1-5: less heat at 30 fps (the shared runtime changes of NFSU2 v32).
 - u1-4: fix a crash in the EA Trax menu, race state for Auto Pad/Drive, the GPU wait sleeps.
@@ -16,6 +39,7 @@ below are the fork's build tags.
 
 ## NFSU2 (iOS, Linux, Switch)
 
+- v34: upstream 0.5.13 merged: lifter fixes (flag joins, rounding float to int, D3D to D3D function pointers, split-off stubs), one "rendered" semaphore per swapchain image, options for car reflections, resolution scale, anisotropic filtering, vibration and audio volumes (`NFSU2_OPTIONS=0` turns them off), SaltyNX frame rate and clock manager fixes on the Switch. On iOS the bulk pushbuffer path (`RECOMP_PB_RUN`) and the per-axis vertex snap (`RECOMP_VK_SNAP`) are off, and the render scale stays with `RECOMP_GL_SCALE`.
 - v33: one tree with NFSU1, original icons.
 - v32: less heat at 30 fps: fewer wake-ups, screen buffer at render size, 30 fps when the phone is hot, CPU log lines.
 - v31: the D3D fence wait sleeps instead of spinning.
