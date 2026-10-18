@@ -1118,6 +1118,8 @@ int main(int argc, char **argv)
         /* 60 fps races (v27): present every vblank. The panel row has
          * def_on = 1 to match; a "0" in nfsu2_env.txt still wins. */
         setenv("RECOMP_PRESENT_INTERVAL", "1", 0);
+        /* In-game options are off on iOS, as in v33; NFSU2_OPTIONS=1 turns them on. */
+        setenv("NFSU2_OPTIONS", "0", 0);
         game_env_defaults();   /* per game; the panel rows show the same */
     }
     {

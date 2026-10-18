@@ -60,7 +60,7 @@ RECOMP_WIDESCREEN=0
 | `NFSU2_MOVIE_FLASH=1` | Keep the opening trailer's white flash frames (shown black by default). |
 | `NFSU2_SWITCH_TEXT` | Switch wording in the menus (Start → +, no Xbox Live/hard-disk names): 1 on (Switch default), 0 off. |
 | `NFSU2_EXIT_TRACE=1` | Print the guest state at exit. |
-| `NFSU2_OPTIONS=0` | NFSU2: no in-game option rows (Car Reflections, Resolution Scale, Anisotropic, Vibration), no `nfsu2x_options.txt`, no audio volume restore, no option labels. Default 1. |
+| `NFSU2_OPTIONS=0` | NFSU2: no in-game option rows (Car Reflections, Resolution Scale, Anisotropic, Vibration), no `nfsu2x_options.txt`, no audio volume restore, no option labels. Default 1; 0 on iOS (set 1 in `nfsu2_env.txt` to turn them on). |
 | `RECOMP_OPTION_SCALE=1\|0` | NFSU2, Vulkan: the Resolution Scale row decides the render scale (1) or `RECOMP_GL_SCALE` does and the row is hidden (0). Default 1; 0 on iOS. |
 | `RECOMP_WIDESCREEN=0` | Tell the game the TV is 4:3 (default 16:9). |
 | `RECOMP_CMDLINE` | Command line handed to the title (e.g. `+map intro`). |

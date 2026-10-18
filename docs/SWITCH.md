@@ -56,6 +56,10 @@ yet. The Switch reports its frame rate to SaltyNX (Status Monitor);
 `NFSU2_SALTYNX=0` turns that off. When sys-clk or Horizon OC runs, the
 `NFSU2_*_MHZ` lines are ignored (`NFSU2_CLOCK_FORCE=1` overrides).
 
+Races run at 30 fps by default in this tree (only the iOS build sets
+`RECOMP_PRESENT_INTERVAL=1`). `RECOMP_PRESENT_INTERVAL=1` in `nfsu2x_env.txt`
+runs them at 60 fps; upstream 0.5.13 runs them at 60 by default.
+
 ## Building the NRO
 
 You need devkitA64, switch-sdl2 and switch-mesa from devkitPro, and the

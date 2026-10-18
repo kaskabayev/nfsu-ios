@@ -46,6 +46,7 @@ in this tree.
 - NFSU2: in-game options for car reflections, resolution scale, anisotropic
   filtering and vibration strength; the audio volumes are kept across
   launches (`nfsu2x_options.txt`, see [docs/SETTINGS.md](docs/SETTINGS.md)).
+  On by default; off on iOS (`NFSU2_OPTIONS=1` turns them on).
 - Disc images are read directly (XISO and Redump layouts). You do not need to
   unpack the disc on iOS.
 - Audio through an emulated Xbox sound chip (APU).
