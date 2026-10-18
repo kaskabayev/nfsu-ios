@@ -4131,6 +4131,26 @@ static int upload_vertices(const Nv2aRawBatch *b)
     return 1;
 }
 
+/* RECOMP_VK_SNAP=1|0: the vertex shader's nv2a_snap (gl_vsh.c) puts each
+ * position where a title edge there would land, per axis (1), or shifts both
+ * axes by one constant (0, the rule before the upstream 0.5.13 merge). They
+ * differ at render scales of 2 and up. Default on, except on iOS and in
+ * NFSU1 (game_profile.h): 0 until compared on the device. */
+static int snap_per_axis(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_VK_SNAP");
+#ifdef NFSU2_IOS
+        v = e && *e ? *e != '0' : 0;
+#else
+        v = e && *e ? *e != '0' : 1;
+#endif
+        fprintf(stderr, "[VK] vertex snap: %s\n", v ? "per axis" : "one shift");
+    }
+    return v;
+}
+
 /* ── Back end entry points ────────────────────────────────────────── */
 
 /* std140 blocks (gl_vsh.c / gl_psh.c, Vulkan dialect). */
@@ -4140,7 +4160,7 @@ typedef struct {
     float vpoff[4];
     float aa[2];
     int32_t xform;
-    float snap_y;       /* nv2a_snap's offset for y; surf[3] is x's */
+    float snap_y;       /* nv2a_snap's offset for y; surf[3] is x's. > 1 = the older one-shift rule */
 } VsBlock;
 
 typedef struct {
@@ -4507,7 +4527,8 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
                     fprintf(stderr, "[SNAP] shift scaled to %.2fx\n", snap_k);
             }
             vb->surf[3] = (float)((0.5 - 0.5 * (double)s->w / (double)s->pw) * snap_k);
-            vb->snap_y = (float)((0.5 - 0.5 * (double)s->h / (double)s->ph) * snap_k);
+            vb->snap_y = snap_per_axis()
+                ? (float)((0.5 - 0.5 * (double)s->h / (double)s->ph) * snap_k) : 2.0f;
         }
         memcpy(vb->m, b->composite, sizeof vb->m);
         memcpy(vb->vpoff, b->vp_offset, sizeof vb->vpoff);

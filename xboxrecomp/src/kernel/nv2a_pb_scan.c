@@ -47,6 +47,15 @@ extern uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc,
                                  const uint32_t *p, uint32_t count);
 static int s_exec_enabled = -1;
 static int s_survey;                  /* RECOMP_PB_SCAN: count every method */
+static int s_fast;                    /* bulk method runs, no per-word survey */
+
+/* iOS, as xbox_memory_layout.c derives it (no NFSU2_IOS for this file). */
+#if defined(__APPLE__) && (defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) || \
+                           defined(__IPHONE_OS_VERSION_MIN_REQUIRED__))
+#  define PB_RUN_DEFAULT 0
+#else
+#  define PB_RUN_DEFAULT 1
+#endif
 
 /* Slot + 1 of each (subchannel, method) in s_seen. note() runs for every
  * pushbuffer word, so a linear search here was the executor's largest cost
@@ -237,6 +246,15 @@ void nv2a_pb_scan(uint32_t put_phys)
     if (s_exec_enabled < 0) {
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
         s_survey = getenv("RECOMP_PB_SCAN") != NULL;
+        /* RECOMP_PB_RUN=1|0: take the vertex-constant and index runs in one
+         * loop (nv2a_pb_exec_run) and skip the per-word survey. Default on,
+         * except on iOS (off until measured there). */
+        {
+            const char *e = getenv("RECOMP_PB_RUN");
+            s_fast = s_exec_enabled && !s_survey && (e && *e ? *e != '0' : PB_RUN_DEFAULT);
+            if (s_exec_enabled)
+                fprintf(stderr, "[PB] bulk method runs: %s\n", s_fast ? "on" : "off");
+        }
     }
     if (!(s_exec_enabled || s_survey))
         return;
@@ -314,7 +332,7 @@ void nv2a_pb_scan(uint32_t put_phys)
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            if (s_exec_enabled && !s_survey && count > 1
+            if (s_fast && count > 1
                 && s_get + count * 4 <= PB_RAM_BYTES
                 && nv2a_pb_exec_run(subch, method, noninc,
                                     (const uint32_t *)(mem + (0x80000000u | s_get)), count)) {
@@ -326,7 +344,7 @@ void nv2a_pb_scan(uint32_t put_phys)
             for (uint32_t i = 0; i < count && s_get < PB_RAM_BYTES; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
-                if (s_survey)
+                if (!s_fast)
                     note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never

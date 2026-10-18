@@ -256,10 +256,14 @@ int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
  * smallest d that puts it where a title edge there would put it: between
  * the centres of the real pixels at title pixel ceil(p - 0.5)'s first edge,
  * i.e. p - d in (g - h, g + h] with h = 0.5/k (= 0.5 - offset). d = 0 when
- * that allows (always at k = 1); half-pixel edges (D3D's) keep 0.5 - h. */
+ * that allows (always at k = 1); half-pixel edges (D3D's) keep 0.5 - h.
+ * u_snap_y > 1 (RECOMP_VK_SNAP=0 in nv2a_vk.c) selects the older rule: one
+ * constant shift, u_surf.w, for both axes (NV2A_SNAP_GLSL's). */
 #define NV2A_SNAP_VK_GLSL \
     "vec2 nv2a_snap(vec2 sw, float w) {\n" \
     "    if (w <= 0.0) return sw;\n" \
+    "    if (u_snap_y > 1.0)\n" \
+    "        return (trunc(sw / w * 16.0) / 16.0 - u_surf.w) * w;\n" \
     "    vec2 h = vec2(0.5) - vec2(u_surf.w, u_snap_y);\n" \
     "    vec2 p = trunc(sw / w * 16.0) / 16.0;\n" \
     "    vec2 f = p - floor(p);\n" \
