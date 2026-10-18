@@ -2998,6 +2998,296 @@ static int      s_ios_present_mode;
 static uint32_t s_ios_suboptimal, s_ios_rebuilds;
 #endif
 
+#ifdef NFSU2_IOS
+/* Present timing (VK_GOOGLE_display_timing, MoltenVK) and pacing. Executor
+ * thread only. Every present carries a presentID; MoltenVK reports when it
+ * was shown (the same clock as clock_gettime_nsec_np(CLOCK_UPTIME_RAW)), also
+ * when no time was asked for. RECOMP_VK_PACE=1 (default) asks for a time:
+ * the next vsync of the display grid that keeps the game's own cadence. =0
+ * only measures. The grid is 60 Hz: the app is capped at 60 on iPhone, and
+ * a slot of the 60 Hz grid is also a slot on a 120 Hz display. */
+#define PC_V        16666667ull         /* one refresh, ns */
+#define PC_RING     64                  /* presents remembered, by presentID */
+#define PC_HIST     8                   /* flip intervals and phase samples kept */
+
+static PFN_vkGetPastPresentationTimingGOOGLE p_past_timing;
+static PFN_vkGetRefreshCycleDurationGOOGLE   p_refresh_cycle;
+static int s_pc_ext;                    /* extension on, both procs loaded */
+
+static struct {
+    int      on;                        /* RECOMP_VK_PACE */
+    uint64_t lmin;                      /* RECOMP_VK_PACE_MS, ns */
+    uint32_t id;                        /* last presentID given */
+    uint32_t seen;                      /* highest presentID reported shown */
+    struct { uint32_t id; uint64_t flip; } ring[PC_RING];   /* when each present's flip began */
+    uint64_t last_flip;
+    uint32_t ivl[PC_HIST], nivl;        /* flip-to-flip intervals, whole refreshes */
+    uint64_t res[PC_HIST];              /* actual present time mod PC_V, oldest first */
+    uint32_t nres;
+    int      have_phase;
+    uint64_t phase;                     /* where the grid sits, 0..PC_V-1 */
+    uint64_t t_prev;                    /* the last slot asked for, 0 = none */
+    uint32_t last_id;                   /* last reported present and when */
+    uint64_t last_actual;
+    /* 10 s window */
+    uint32_t guard;                     /* presents left unpaced by the bound */
+    uint32_t shown, scr[4], late, nlat;
+    uint64_t lat_sum, lat_max;
+} s_pace;
+
+static uint64_t pace_now(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+/* Park, swapchain rebuild or a long gap: forget the cadence, the phase and
+ * the slot. Presents already given up are not waited for. */
+static void pace_reset(void)
+{
+    s_pace.last_flip = 0;
+    s_pace.nivl = 0;
+    s_pace.nres = 0;
+    s_pace.have_phase = 0;
+    s_pace.t_prev = 0;
+    s_pace.last_id = 0;
+    s_pace.seen = s_pace.id;
+}
+
+static void pace_sort(uint64_t *a, uint32_t n)
+{
+    uint32_t i, j;
+    for (i = 1; i < n; i++) {
+        uint64_t v = a[i];
+        for (j = i; j > 0 && a[j - 1] > v; j--)
+            a[j] = a[j - 1];
+        a[j] = v;
+    }
+}
+
+/* vk_flip entry: the flip time, and the interval since the last one. */
+static void pace_flip(uint64_t t)
+{
+    if (s_pace.last_flip && t - s_pace.last_flip > 250000000ull)
+        pace_reset();
+    if (s_pace.last_flip) {
+        uint64_t n = (t - s_pace.last_flip + PC_V / 2) / PC_V;
+        if (s_pace.nivl == PC_HIST) {
+            memmove(s_pace.ivl, s_pace.ivl + 1, (PC_HIST - 1) * sizeof s_pace.ivl[0]);
+            s_pace.nivl--;
+        }
+        s_pace.ivl[s_pace.nivl++] = n > 255 ? 255 : (uint32_t)n;
+    }
+    s_pace.last_flip = t;
+}
+
+/* Whole refreshes between flips: the median of the last intervals, 1..4.
+ * 0 while there are too few. */
+static uint32_t pace_cadence(void)
+{
+    uint64_t a[PC_HIST];
+    uint32_t i, n = s_pace.nivl, m;
+    if (n < 3)
+        return 0;
+    for (i = 0; i < n; i++)
+        a[i] = s_pace.ivl[i];
+    pace_sort(a, n);
+    m = (uint32_t)a[n / 2];
+    return m < 1 ? 1 : m > 4 ? 4 : m;
+}
+
+/* a - b on the circle of one refresh, -PC_V/2 .. PC_V/2. */
+static int64_t pace_diff(uint64_t a, uint64_t b)
+{
+    int64_t d = (int64_t)a - (int64_t)b;
+    if (d > (int64_t)(PC_V / 2)) d -= (int64_t)PC_V;
+    else if (d < -(int64_t)(PC_V / 2)) d += (int64_t)PC_V;
+    return d;
+}
+
+/* The grid phase from the last present times. A present that was not shown
+ * gets the time of the callback, which is not on the grid: take the sample
+ * that most others sit near (within PC_V/8), then the median of those. At
+ * least 3 must agree. */
+static void pace_find_phase(void)
+{
+    int64_t d[PC_HIST], m;
+    uint64_t a[PC_HIST];
+    uint32_t i, j, n = s_pace.nres, best = 0, bestn = 0, cnt;
+    s_pace.have_phase = 0;
+    for (i = 0; i < n; i++) {
+        cnt = 0;
+        for (j = 0; j < n; j++) {
+            int64_t e = pace_diff(s_pace.res[j], s_pace.res[i]);
+            if (e >= -(int64_t)(PC_V / 8) && e <= (int64_t)(PC_V / 8))
+                cnt++;
+        }
+        if (cnt >= bestn) {             /* later (newer) wins a tie */
+            bestn = cnt;
+            best = i;
+        }
+    }
+    if (bestn < 3)
+        return;
+    for (i = 0, cnt = 0; i < n; i++) {
+        d[cnt] = pace_diff(s_pace.res[i], s_pace.res[best]);
+        if (d[cnt] >= -(int64_t)(PC_V / 8) && d[cnt] <= (int64_t)(PC_V / 8))
+            cnt++;
+    }
+    for (i = 0; i < cnt; i++)
+        a[i] = (uint64_t)(d[i] + (int64_t)PC_V);        /* sort as unsigned */
+    pace_sort(a, cnt);
+    m = (int64_t)a[cnt / 2] - (int64_t)PC_V;
+    m += (int64_t)s_pace.res[best];
+    if (m < 0) m += (int64_t)PC_V;
+    if (m >= (int64_t)PC_V) m -= (int64_t)PC_V;
+    s_pace.phase = (uint64_t)m;
+    s_pace.have_phase = 1;
+}
+
+/* One report from vkGetPastPresentationTimingGOOGLE. */
+static void pace_note(const VkPastPresentationTimingGOOGLE *pt)
+{
+    uint32_t id = pt->presentID;
+    uint64_t act = pt->actualPresentTime;
+    uint64_t flip = s_pace.ring[id % PC_RING].id == id ? s_pace.ring[id % PC_RING].flip : 0;
+    if ((int32_t)(id - s_pace.seen) > 0)
+        s_pace.seen = id;
+    s_pace.shown++;
+    if (s_pace.last_id && id == s_pace.last_id + 1 && act > s_pace.last_actual) {
+        uint64_t n = (act - s_pace.last_actual + PC_V / 2) / PC_V;
+        s_pace.scr[n < 1 ? 0 : n > 4 ? 3 : n - 1]++;
+    }
+    s_pace.last_id = id;
+    s_pace.last_actual = act;
+    if (pt->desiredPresentTime && act > pt->desiredPresentTime + PC_V / 2)
+        s_pace.late++;
+    if (flip && act > flip) {
+        s_pace.nlat++;
+        s_pace.lat_sum += act - flip;
+        if (act - flip > s_pace.lat_max)
+            s_pace.lat_max = act - flip;
+    }
+    if (s_pace.nres == PC_HIST) {
+        memmove(s_pace.res, s_pace.res + 1, (PC_HIST - 1) * sizeof s_pace.res[0]);
+        s_pace.nres--;
+    }
+    s_pace.res[s_pace.nres++] = act % PC_V;
+}
+
+/* Take what MoltenVK has reported since the last call (it removes what it
+ * returns and keeps 60), without waiting. */
+static void pace_poll(void)
+{
+    VkPastPresentationTimingGOOGLE pt[16];
+    int round;
+    for (round = 0; round < 4; round++) {
+        uint32_t n = 0, i;
+        VkResult r = p_past_timing(s_dev, s_swapchain, &n, NULL);
+        if (r != VK_SUCCESS || !n)
+            break;
+        if (n > 16)
+            n = 16;
+        r = p_past_timing(s_dev, s_swapchain, &n, pt);
+        if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+            break;
+        for (i = 0; i < n; i++)
+            pace_note(&pt[i]);
+        if (n < 16)
+            break;
+    }
+    pace_find_phase();
+}
+
+/* The first slot of the grid at or after x. */
+static uint64_t pace_slot_ge(uint64_t x)
+{
+    uint64_t base = x - x % PC_V + s_pace.phase;
+    return base < x ? base + PC_V : base;
+}
+
+/* The time to ask for with the present that is about to go out, 0 = as soon
+ * as it is done. now is read right before the present call. */
+static uint64_t pace_desired(uint64_t now)
+{
+    uint64_t v = PC_V, p, t, d;
+    pace_poll();
+    p = pace_cadence();
+    if (!s_pace.on || !s_pace.have_phase || !p) {
+        s_pace.t_prev = 0;
+        return 0;
+    }
+    /* The bound: this present waits for a future time only when at most one
+     * earlier present is not shown yet. Then at most two of the swapchain's
+     * three images are held after it, and the next acquire finds one free. */
+    if (s_pace.id - s_pace.seen >= 2) {
+        s_pace.guard++;
+        s_pace.t_prev = 0;
+        return 0;
+    }
+    /* One cadence step on from the last slot, put on the current grid so the
+     * slot follows the display's own clock. Too early to be done, or more
+     * than a step ahead of the game: the first slot that is done in time. */
+    t = s_pace.t_prev ? pace_slot_ge(s_pace.t_prev + p * v - v / 2) : 0;
+    if (!t || t < now + s_pace.lmin || t > now + s_pace.lmin + p * v)
+        t = pace_slot_ge(now + s_pace.lmin);
+    if (s_pace.t_prev && t < s_pace.t_prev + v - v / 4)     /* one refresh per present */
+        t = pace_slot_ge(s_pace.t_prev + v - v / 4);
+    s_pace.t_prev = t;
+    d = t - v / 4;              /* a quarter early: the slot's own vsync is the first one after it */
+    return d > now + 2 * v ? now + 2 * v : d;
+}
+
+/* The VkPresentInfoKHR chain for this present. */
+static void pace_stamp(VkPresentInfoKHR *pi, VkPresentTimesInfoGOOGLE *pti,
+                       VkPresentTimeGOOGLE *ptm, uint64_t t_flip)
+{
+    uint64_t d = pace_desired(pace_now());
+    ptm->presentID = ++s_pace.id;
+    ptm->desiredPresentTime = d;
+    s_pace.ring[ptm->presentID % PC_RING].id = ptm->presentID;
+    s_pace.ring[ptm->presentID % PC_RING].flip = t_flip;
+    pti->sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
+    pti->swapchainCount = 1;
+    pti->pTimes = ptm;
+    pi->pNext = pti;
+}
+
+/* The [pace] line of the 10 s window (next to [ios-vk]). */
+static void pace_log(void)
+{
+    if (!s_pc_ext)
+        return;
+    fprintf(stderr, "[pace] 10 s: %s, %u frames shown, on screen 1v %u 2v %u 3v %u 4+v %u, "
+            "late %u, flip->shown avg %.1f ms max %.1f ms\n",
+            s_pace.on ? "on" : "off", s_pace.shown, s_pace.scr[0], s_pace.scr[1],
+            s_pace.scr[2], s_pace.scr[3], s_pace.late,
+            s_pace.nlat ? s_pace.lat_sum / 1e6 / s_pace.nlat : 0.0, s_pace.lat_max / 1e6);
+    if (s_pace.guard)
+        fprintf(stderr, "[pace] 10 s: %u presents went at once (2 earlier ones not shown yet)\n",
+                s_pace.guard);
+    s_pace.guard = s_pace.shown = s_pace.late = s_pace.nlat = 0;
+    s_pace.scr[0] = s_pace.scr[1] = s_pace.scr[2] = s_pace.scr[3] = 0;
+    s_pace.lat_sum = s_pace.lat_max = 0;
+}
+
+/* After the first swapchain: the switches, once. */
+static void pace_init(void)
+{
+    VkRefreshCycleDurationGOOGLE rc = { 0 };
+    double ms;
+    const char *e = getenv("RECOMP_VK_PACE");
+    s_pace.on = e && *e ? *e != '0' : 1;
+    e = getenv("RECOMP_VK_PACE_MS");
+    ms = e && *e ? strtod(e, NULL) : 12.0;
+    if (!(ms >= 0.0 && ms <= 50.0))
+        ms = 12.0;
+    s_pace.lmin = (uint64_t)(ms * 1e6);
+    p_refresh_cycle(s_dev, s_swapchain, &rc);
+    fprintf(stderr, "[pace] present pacing: %s (RECOMP_VK_PACE), refresh %llu ns\n",
+            s_pace.on ? "on" : "off", (unsigned long long)rc.refreshDuration);
+}
+#endif
+
 static int create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -3080,6 +3370,7 @@ static void sc_rebuild(void)
 #ifdef NFSU2_IOS
     s_sc_last_rebuild_ns = hz_now();
     s_ios_rebuilds++;
+    pace_reset();
 #endif
 }
 
@@ -3179,7 +3470,7 @@ static int ready_impl(void)
 #ifdef NFSU2_IOS
     VkDeviceQueueGlobalPriorityCreateInfoEXT gpi =
         { VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT };
-    int have_gprio = 0, want_gprio = 0;
+    int have_gprio = 0, want_gprio = 0, have_dtime = 0;
 #endif
     const char *layers[1];
     uint32_t nlayers = 0;
@@ -3394,6 +3685,9 @@ static int ready_impl(void)
                     if (!strcmp(props[di].extensionName,
                                 VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
                         have_gprio = 1;
+                    if (!strcmp(props[di].extensionName,
+                                VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME))
+                        have_dtime = 1;
 #endif
                 }
                 free(props);
@@ -3414,6 +3708,10 @@ static int ready_impl(void)
             dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
     }
 #ifdef NFSU2_IOS
+    /* Present times and reports. Before the queue priority: the retry below
+     * drops the last extension. */
+    if (have_dtime && !s_headless)
+        dext[ndext++] = VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
     {
         /* MoltenVK maps HIGH to QOS_CLASS_USER_INTERACTIVE for its async
          * dispatch queue (default USER_INITIATED). Added LAST: the retry
@@ -3472,12 +3770,32 @@ static int ready_impl(void)
     GET(p_stencil_test, "vkCmdSetStencilTestEnable");
     GET(p_stencil_op, "vkCmdSetStencilOp");
 #undef GET
+#ifdef NFSU2_IOS
+    /* Not through GET: without them the renderer still runs. */
+    if (have_dtime && !s_headless) {
+        p_past_timing = (PFN_vkGetPastPresentationTimingGOOGLE)
+            vkGetDeviceProcAddr(s_dev, "vkGetPastPresentationTimingGOOGLE");
+        p_refresh_cycle = (PFN_vkGetRefreshCycleDurationGOOGLE)
+            vkGetDeviceProcAddr(s_dev, "vkGetRefreshCycleDurationGOOGLE");
+        s_pc_ext = p_past_timing && p_refresh_cycle;
+    }
+    if (!s_pc_ext)
+        fprintf(stderr, "[pace] VK_GOOGLE_display_timing %s: no present timing, no pacing\n",
+                have_dtime && !s_headless ? "procs missing" : "not available");
+#endif
 
     fprintf(stderr, "[VKINIT] device+GET done\n"); fflush(stderr);
     if (!s_headless && !create_swapchain()) {
         LOGE("swapchain creation failed; running headless\n");
         s_headless = 1;
+#ifdef NFSU2_IOS
+        s_pc_ext = 0;
+#endif
     }
+#ifdef NFSU2_IOS
+    if (s_pc_ext)
+        pace_init();
+#endif
 
     {
         VkDescriptorSetLayoutBinding b[7];
@@ -3631,6 +3949,7 @@ static void ios_park_point(void)
         }
     }
     fprintf(stderr, "[ios] unpark after %u ms\n", (unsigned)((hz_now() - t0) / 1000000ull));
+    pace_reset();
 }
 #endif
 
@@ -4799,11 +5118,16 @@ static void vk_flip(void)
 #ifdef NFSU2_IOS
     int acq_ok = 0;                 /* this frame's acquire returned VK_SUCCESS */
     uint64_t t_sub = 0, t_pre = 0;
+    uint64_t t_flip = pace_now();   /* flip entry, for the flip->shown time */
     int presented = 0;
 #endif
 
     if (!ready())
         return;
+#ifdef NFSU2_IOS
+    if (s_pc_ext)
+        pace_flip(t_flip);
+#endif
     pend_flush();
     s_frame++;
     {
@@ -5078,6 +5402,10 @@ static void vk_flip(void)
     if (have_image && s_f->submitted) {
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         VkResult pr;
+#ifdef NFSU2_IOS
+        VkPresentTimesInfoGOOGLE pti = { VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE };
+        VkPresentTimeGOOGLE ptm;
+#endif
         pi.waitSemaphoreCount = 1;
         pi.pWaitSemaphores = &s_sc_rendered[idx];
         pi.swapchainCount = 1;
@@ -5085,6 +5413,8 @@ static void vk_flip(void)
         pi.pImageIndices = &idx;
         VT("flip %u: vkQueuePresentKHR\n", s_frame);
 #ifdef NFSU2_IOS
+        if (s_pc_ext)
+            pace_stamp(&pi, &pti, &ptm, t_flip);
         t_pre = hz_now();
 #endif
         pr = vkQueuePresentKHR(s_queue, &pi);
@@ -5143,6 +5473,7 @@ static void vk_flip(void)
                     npre ? pre_sum / 1e6 / npre : 0.0, pre_max / 1e6,
                     s_ios_suboptimal - sub_base, s_ios_rebuilds - reb_base,
                     s_ios_present_mode, mvk ? mvk : "unset");
+            pace_log();
             /* Second line, same window: render-pass splits per flip. */
             {
                 double nf = flips ? (double)flips : 1.0;

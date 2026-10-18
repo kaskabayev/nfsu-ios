@@ -46,10 +46,12 @@
  * the settings panels show the same default (xbox_app_default_on). NFSU1:
  * 4:3 and no movie crop until both are checked for this title; the
  * upstream 0.5.13 renderer paths (bulk pushbuffer runs, per-axis vertex snap)
- * stay off until they are checked here. */
+ * stay off until they are checked here. iOS present pacing only measures
+ * (RECOMP_VK_PACE=0): the build as it was is device-confirmed good. */
 #define NFSU_ENV_DEFAULTS \
     { { "RECOMP_WIDESCREEN", "0" }, { "NFSU2_MOVIE_CROP", "0" }, \
-      { "RECOMP_PB_RUN", "0" }, { "RECOMP_VK_SNAP", "0" }, { NULL, NULL } }
+      { "RECOMP_PB_RUN", "0" }, { "RECOMP_VK_SNAP", "0" }, \
+      { "RECOMP_VK_PACE", "0" }, { NULL, NULL } }
 
 /* Hooks the title has. NFSU1's image has no .data float at 0x3A4C64 (outside
  * the image), and NFSU2's string-table patch does not apply. */

@@ -133,6 +133,8 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_VK_CUBE=0` | Vulkan: no cube maps (car reflections off). The in-game Car Reflections row does the same at run time. |
 | `RECOMP_VK_SNAP=1\|0` | Vulkan vertex snap: 1 puts each position where a title edge there would land, per axis; 0 shifts both axes by one constant (the rule before 0.5.13). They differ at render scales of 2 and up. Default 1; 0 in NFSU1. |
 | `RECOMP_PB_RUN=1\|0` | Take vertex-constant and index runs of the pushbuffer in one loop and skip the per-word survey. Default 1; 0 on iOS and in NFSU1. |
+| `RECOMP_VK_PACE=1\|0` | iOS, Vulkan: ask for each frame's present time (the next refresh on the 60 Hz grid that keeps the game's own rate), 0 = only measure. The `[pace]` line every 10 s counts frames by the refreshes they stayed on screen (`1v` .. `4+v`) and the `late` ones. Default 1; 0 in NFSU1. |
+| `RECOMP_VK_PACE_MS=<ms>` | With `RECOMP_VK_PACE`: the least time between the game's frame and the refresh that shows it (default 12, 0..50). |
 | `RECOMP_VK_DUMP_ALL=1` | With `RECOMP_GL_DUMP`: dump every surface too, as `<prefix><frame>_<va>.bmp`. |
 | `RECOMP_DRAW_MERGE_STATS=1` | With `RECOMP_DRAW_STATS=1`: also survey draws that match the previous one (hashes every index; slow). |
 | `RECOMP_VK_HEADLESS=1` | Vulkan on Linux: no window (also implied by `SDL_VIDEODRIVER=offscreen`). |
