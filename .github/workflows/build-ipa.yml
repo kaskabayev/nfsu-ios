@@ -1,0 +1,518 @@
+# Build the iOS IPA of NFSU2 or NFSU1 from your own game file.
+#
+# Run this in a PRIVATE copy of the repository only. The lifted C is the
+# game's code in another form, and it must never be public. Both jobs stop
+# when the repository is public. See "Build the IPA on GitHub Actions" in
+# README.md.
+#
+# Job "lift" (Linux): takes <game>.xbe from a release of this repository,
+# checks its SHA-256, lifts it to C and passes the C to the next job as a
+# short-lived artifact.
+# Job "ipa" (macOS): builds the app from this commit and the lifted C, and
+# packs an unsigned IPA.
+name: build-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      game:
+        description: Game to build
+        type: choice
+        options:
+          - nfsu2
+          - nfsu1
+        default: nfsu2
+      xbe_release:
+        description: Release tag (in this repository) that holds <game>.xbe
+        type: string
+        default: xbe
+      bundle_id:
+        description: Bundle ID of the app (empty = io.github.<owner>.<game>)
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  lift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      GAME: ${{ inputs.game }}
+      XBE_RELEASE: ${{ inputs.xbe_release }}
+    steps:
+      - name: Require a private repository
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ "$IS_PRIVATE" != "true" ]; then
+            echo "::error::Run this only in a private repository: the lifted code is the game's code and must not be public."
+            exit 1
+          fi
+          case "$GAME" in
+            nfsu2|nfsu1) ;;
+            *) echo "::error::Unknown game: $GAME"; exit 1 ;;
+          esac
+          case "$XBE_RELEASE" in
+            ''|-*|*[!A-Za-z0-9._/-]*)
+              echo "::error::xbe_release must be a release tag: letters, digits, dot, underscore, slash and hyphen only, no leading hyphen."
+              exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # The lifter (tools.xbe_parser, disasm, func_id, abi_analysis, recomp)
+      # imports only capstone besides the standard library.
+      - name: Python packages
+        run: python -m pip install capstone==5.0.9
+
+      - name: Get the game file from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/xbe"
+          if ! gh release download "$XBE_RELEASE" -R "$GITHUB_REPOSITORY" \
+                 -p "$GAME.xbe" -O "$RUNNER_TEMP/xbe/default.xbe" --clobber; then
+            echo "::error::Cannot download $GAME.xbe from release '$XBE_RELEASE' of this repository. Create the release and attach the file."
+            exit 1
+          fi
+          test -s "$RUNNER_TEMP/xbe/default.xbe"
+
+      - name: Check the game file
+        run: |
+          P="games/$GAME/game_profile.h"
+          WANT="$(grep -A1 'define NFSU_XBE_SHA256' "$P" | grep -oE '"[0-9a-f]{64}"' | tr -d '"')"
+          TID="$(grep -oE 'NFSU_XBE_TITLE_ID +0x[0-9A-Fa-f]+' "$P" | awk '{print $2}')"
+          if [ "${#WANT}" -ne 64 ] || [ -z "$TID" ]; then
+            echo "::error::Cannot read NFSU_XBE_SHA256 or NFSU_XBE_TITLE_ID from $P."
+            exit 1
+          fi
+          HAVE="$(sha256sum "$RUNNER_TEMP/xbe/default.xbe" | cut -d' ' -f1)"
+          echo "expected sha256: $WANT"
+          echo "found sha256:    $HAVE"
+          if [ "$HAVE" != "$WANT" ]; then
+            echo "::error::$GAME.xbe is not the expected file. This build needs default.xbe of the NTSC-U disc of $GAME (title ID $TID, SHA-256 $WANT). The file in release '$XBE_RELEASE' has SHA-256 $HAVE."
+            exit 1
+          fi
+
+      - name: Lift the game
+        run: |
+          T0=$(date +%s)
+          XBE="$RUNNER_TEMP/xbe/default.xbe" GEN=gen tools/lift.sh "$GAME"
+          SECS=$(( $(date +%s) - T0 ))
+          echo "Lift time: $SECS s"
+          echo "LIFT_SECS=$SECS" >> "$GITHUB_ENV"
+          test -f gen/recomp_funcs.h
+
+      - name: Manifest of the lifted files (hashes only)
+        run: |
+          (cd gen && find . -type f ! -name xbe_analysis.json -printf '%P\n' \
+             | LC_ALL=C sort | xargs -d '\n' sha256sum) > gen.manifest
+          LINES="$(wc -l < gen.manifest)"
+          SUM="$(sha256sum gen.manifest | cut -d' ' -f1)"
+          {
+            echo "### Lift: $GAME"
+            echo
+            echo "- Lift time: $LIFT_SECS s"
+            echo "- Files in the manifest: $LINES"
+            echo "- SHA-256 of the manifest: \`$SUM\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "manifest lines: $LINES"
+          echo "manifest sha256: $SUM"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gen-manifest-${{ inputs.game }}
+          path: gen.manifest
+          retention-days: 7
+
+      - name: Pack the lifted code
+        run: |
+          command -v zstd >/dev/null || sudo apt-get install -y zstd
+          tar -C gen --exclude=./xbe_analysis.json -cf - . | zstd -T0 -3 -q -o "$RUNNER_TEMP/gen-$GAME.tar.zst"
+          ls -l "$RUNNER_TEMP/gen-$GAME.tar.zst"
+
+      # The artifact holds the game's code. Only people with read access to
+      # this private repository can download it. It is deleted after 1 day.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gen-${{ inputs.game }}
+          path: ${{ runner.temp }}/gen-${{ inputs.game }}.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+  ipa:
+    needs: lift
+    runs-on: macos-14
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    env:
+      GAME: ${{ inputs.game }}
+      GAME_UP: ${{ inputs.game == 'nfsu2' && 'NFSU2' || 'NFSU1' }}
+    steps:
+      - name: Require a private repository
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ "$IS_PRIVATE" != "true" ]; then
+            echo "::error::Run this only in a private repository: the lifted code is the game's code and must not be public."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Settings (bundle ID)
+        env:
+          BUNDLE_INPUT: ${{ inputs.bundle_id }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          BID="$BUNDLE_INPUT"
+          if [ -z "$BID" ]; then
+            OWNER_ID="$(printf '%s' "$OWNER" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n-' '-')"
+            BID="io.github.${OWNER_ID}.${GAME}"
+          fi
+          if ! printf '%s' "$BID" | grep -qE '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'; then
+            echo "::error::bundle_id must look like com.example.app: parts of letters, digits and hyphens, separated by dots."
+            exit 1
+          fi
+          echo "BUNDLE_ID=$BID" >> "$GITHUB_ENV"
+          echo "Bundle ID: $BID"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gen-${{ inputs.game }}
+          path: ${{ runner.temp }}/gen-art
+
+      - name: Unpack the lifted code
+        run: |
+          command -v zstd >/dev/null || brew install zstd
+          mkdir -p gen
+          zstd -d -c "$RUNNER_TEMP/gen-art/gen-$GAME.tar.zst" | tar -xf - -C gen
+          test -f gen/recomp_funcs.h
+          echo "files in gen: $(find gen -type f | wc -l | tr -d ' ')"
+
+      - name: Fail-fast syntax check (ObjC + main.c, no SDL)
+        run: |
+          set -u
+          SRC=xboxrecomp/src
+          rc=0
+          OBJC_FILES="$SRC/platform/ios_touch_overlay.m"
+          if [ -f "$SRC/platform/ios_keyboard.m" ]; then
+            OBJC_FILES="$OBJC_FILES $SRC/platform/ios_keyboard.m"
+          fi
+          if [ -f "$SRC/platform/ios_vblank.m" ]; then
+            OBJC_FILES="$OBJC_FILES $SRC/platform/ios_vblank.m"
+          fi
+          if [ -f src/ios_launcher.m ]; then
+            OBJC_FILES="$OBJC_FILES src/ios_launcher.m"
+          fi
+          for f in $OBJC_FILES; do
+            echo "::group::syntax $f"
+            xcrun -sdk iphoneos clang -fsyntax-only -arch arm64 -miphoneos-version-min=16.0 \
+              -fno-caret-diagnostics -fobjc-arc -Wall "$f" || rc=1
+            echo "::endgroup::"
+          done
+          INC=(-Isrc "-Igames/$GAME" -Igen -Ixboxrecomp/include
+               -I$SRC/kernel -I$SRC/platform -I$SRC/d3d -I$SRC/audio -I$SRC/apu
+               -I$SRC/input -I$SRC/usb -I$SRC/nv2a -I$SRC/video -I$SRC/nv2a_gl -I$SRC)
+          # main.c plus the disc-image kernel files: Apple headers differ in
+          # pread/lseek/fnmatch/pthread from the Linux ones they were checked on.
+          for f in src/main.c "games/$GAME/state.c" $SRC/kernel/kernel_file.c \
+                   $SRC/kernel/kernel_path.c $SRC/kernel/xbox_xiso.c; do
+            echo "::group::syntax $f"
+            xcrun -sdk iphoneos clang -fsyntax-only -arch arm64 -miphoneos-version-min=16.0 \
+              -fno-caret-diagnostics -std=gnu11 -DNOMINMAX -DWIN32_LEAN_AND_MEAN "${INC[@]}" "$f" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      - name: Tools
+        run: |
+          brew install cmake ninja pkg-config python3 ccache
+          {
+            echo "CCACHE_DIR=$HOME/Library/Caches/ccache"
+            echo "CCACHE_MAXSIZE=3G"
+            echo "CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache ios-deps (SDL2 + glslang)
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: ~/ios-deps
+          key: ios-deps-${{ runner.os }}-sdl2.30.9-glslang15.1.0-v1
+
+      - name: SDL2 (iOS arm64 static)
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch release-2.30.9 https://github.com/libsdl-org/SDL.git /tmp/SDL
+          cmake -S /tmp/SDL -B /tmp/SDL/b -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF \
+            -DSDL_VULKAN=ON \
+            -DCMAKE_INSTALL_PREFIX=$HOME/ios-deps
+          cmake --build /tmp/SDL/b -j4 && cmake --install /tmp/SDL/b
+
+      - name: glslang + SPIRV-Tools (iOS arm64 static)
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch 15.1.0 https://github.com/KhronosGroup/glslang.git /tmp/glslang
+          cd /tmp/glslang && python3 update_glslang_sources.py
+          cmake -S . -B b -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DENABLE_OPT=ON -DENABLE_GLSLANG_BINARIES=OFF -DBUILD_EXTERNAL=ON \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/ios-deps
+          cmake --build b -j4 && cmake --install b
+          find b -name 'libSPIRV-Tools*.a' -exec cp {} $HOME/ios-deps/lib/ \;
+
+      - name: Fail-fast syntax check (C files that include SDL.h)
+        run: |
+          set -u
+          SRC=xboxrecomp/src
+          rc=0
+          INC=(-Isrc -Igen -Ixboxrecomp/include
+               -I$SRC/kernel -I$SRC/platform -I$SRC/d3d -I$SRC/audio -I$SRC/apu
+               -I$SRC/input -I$SRC/usb -I$SRC/nv2a -I$SRC/video -I$SRC/nv2a_gl -I$SRC
+               -I$HOME/ios-deps/include/SDL2 -I$HOME/ios-deps/include)
+          for f in "$SRC/input/xinput_ios.c" "$SRC/input/xinput_device.c"; do
+            echo "::group::syntax $f"
+            xcrun -sdk iphoneos clang -fsyntax-only -arch arm64 -miphoneos-version-min=16.0 \
+              -fno-caret-diagnostics -std=gnu11 -DNOMINMAX -DWIN32_LEAN_AND_MEAN "${INC[@]}" "$f" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      - name: Cache MoltenVK
+        id: cache-mvk
+        uses: actions/cache@v4
+        with:
+          path: ~/mvk
+          key: mvk-${{ runner.os }}-1.4.2-v1
+
+      - name: MoltenVK (prebuilt ios-arm64)
+        if: steps.cache-mvk.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v1.4.2 -R KhronosGroup/MoltenVK -p 'MoltenVK-ios.tar' -O /tmp/mvk.tar
+          mkdir -p $HOME/mvk && tar -xf /tmp/mvk.tar -C $HOME/mvk
+          find $HOME/mvk -name 'MoltenVK.framework' -maxdepth 6 | head -3
+
+      - name: Cache Vulkan headers
+        id: cache-vkh
+        uses: actions/cache@v4
+        with:
+          path: ~/vkh
+          key: vkh-${{ runner.os }}-1.3.296-v1
+
+      - name: Vulkan headers
+        if: steps.cache-vkh.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers.git $HOME/vkh
+
+      # restore + an explicit save below: actions/cache@v4 saves only when the
+      # job succeeds, and a failed build should still keep its compiled gen.
+      # The cache holds object files of the lifted code: it stays inside this
+      # private repository.
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-${{ inputs.game }}-${{ runner.os }}-${{ hashFiles('gen/recomp_funcs.h') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.game }}-${{ runner.os }}-${{ hashFiles('gen/recomp_funcs.h') }}-
+            ccache-${{ inputs.game }}-${{ runner.os }}-
+
+      # -fno-caret-diagnostics: compiler messages name the line but do not
+      # print the source text, so the log never holds lifted code.
+      - name: Configure app (iOS, Vulkan renderer)
+        run: |
+          MVK_FW=$(find $HOME/mvk -name 'MoltenVK.framework' -path '*ios*' | head -1)
+          test -n "$MVK_FW"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJC_COMPILER_LAUNCHER=ccache \
+            "-DCMAKE_C_FLAGS=-fno-caret-diagnostics" \
+            "-DNFSU_GAME=$GAME" \
+            "-DNFSU2_GEN_DIR=$PWD/gen" \
+            -DNFSU2_VULKAN=ON \
+            -DCMAKE_PREFIX_PATH=$HOME/ios-deps \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+            -DMOLTENVK_FRAMEWORK="$MVK_FW" \
+            -DVULKAN_HEADERS_DIR=$HOME/vkh/include \
+            -DSDL2_DIR=$HOME/ios-deps/lib/cmake/SDL2 2>&1 | tee cfg.log
+          ! grep -i "configuring incomplete\|cmake error" cfg.log
+
+      - name: Build
+        run: |
+          set -o pipefail
+          set +e
+          ccache -z
+          cmake --build build -- -k 0 2>&1 | tee build.log
+          rc=$?
+          set -e
+          test -f "build/${GAME}_recomp.app/${GAME}_recomp" -o -f "build/${GAME}_recomp" && echo BINARY_OK
+          exit $rc
+
+      - name: Banner check (build tag in the binary)
+        run: |
+          TAG="$(sed -n 's/^#define NFSU_BUILD_TAG[[:space:]]*"\([^"]*\)".*/\1/p' "games/$GAME/game_profile.h")"
+          test -n "$TAG"
+          BIN="build/${GAME}_recomp"
+          [ -f "$BIN" ] || BIN="build/${GAME}_recomp.app/${GAME}_recomp"
+          echo "build tag: $TAG"
+          echo "BUILD_TAG=$TAG" >> "$GITHUB_ENV"
+          test "$(strings "$BIN" | grep -c -F "build $TAG (")" -gt 0
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-${{ inputs.game }}-${{ runner.os }}-${{ hashFiles('gen/recomp_funcs.h') }}-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-logs-${{ inputs.game }}
+          path: "*.log"
+          retention-days: 3
+
+      - name: Package IPA (unsigned, for SideStore)
+        if: success()
+        run: |
+          set -e
+          MVK_FW=$(find $HOME/mvk -name 'MoltenVK.framework' -path '*ios*' | head -1)
+          # CMake's iOS generator already produced build/${GAME}_recomp.app
+          APP=$(find build -maxdepth 2 -name '*.app' -type d | head -1)
+          test -n "$APP" && test -x "$APP/${GAME}_recomp"
+          PLIST="$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ${GAME}_recomp" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string ${GAME}_recomp" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName $GAME_UP" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleName string $GAME_UP" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $GAME_UP" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $GAME_UP" "$PLIST"
+          RUN="${GITHUB_RUN_NUMBER}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $RUN" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $RUN" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString run.$RUN" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string run.$RUN" "$PLIST"
+
+          /usr/libexec/PlistBuddy -c 'Add :UIRequiresFullScreen bool true' "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Add :UIStatusBarHidden bool true' "$PLIST" 2>/dev/null || true
+          # Landscape only - the game is 16:9 widescreen; no portrait layout.
+          /usr/libexec/PlistBuddy -c 'Add :UISupportedInterfaceOrientations array' "$PLIST"
+          /usr/libexec/PlistBuddy -c 'Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationLandscapeLeft' "$PLIST"
+          /usr/libexec/PlistBuddy -c 'Add :UISupportedInterfaceOrientations:1 string UIInterfaceOrientationLandscapeRight' "$PLIST"
+          # Empty UILaunchScreen dict: without a launch screen iOS may run the app in scaled compatibility mode.
+          /usr/libexec/PlistBuddy -c 'Add :UILaunchScreen dict' "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Add :LSApplicationCategoryType string public.app-category.racing-games' "$PLIST" 2>/dev/null || true
+          # iOS Game Mode (CPU/GPU priority, lower Bluetooth controller latency) + controller UI interaction
+          /usr/libexec/PlistBuddy -c 'Add :GCSupportsGameMode bool true' "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Add :GCSupportsControllerUserInteraction bool true' "$PLIST" 2>/dev/null || true
+          # Files app: let the user push NFSUNDER/ into Documents from a PC/Mac
+          /usr/libexec/PlistBuddy -c 'Add :UIFileSharingEnabled bool true' "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Add :LSSupportsOpeningDocumentsInPlace bool true' "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Add :UISupportsDocumentBrowser bool true' "$PLIST" 2>/dev/null || true
+          # App icon. actool compiles ios/Assets.xcassets into Assets.car
+          # and writes the icon keys to a partial plist, which is merged into
+          # Info.plist. The loose PNGs always go into the app: LiveContainer
+          # and sideload tools read them. A failed actool must not fail the
+          # build: fall back to the loose PNGs with explicit icon keys.
+          ICONSRC="games/$GAME/ios"
+          if [ -d "$ICONSRC/icon" ]; then
+            cp "$ICONSRC"/icon/*.png "$APP/"
+          fi
+          rm -f /tmp/icon.plist
+          PB=/usr/libexec/PlistBuddy
+          # Adds the CFBundleIconFiles list (the loose PNGs) under icon key $1
+          # unless the plist already has one. Never fails the build.
+          add_icon_files() {
+            K="$1"
+            if "$PB" -c "Print :$K:CFBundlePrimaryIcon:CFBundleIconFiles" "$PLIST" >/dev/null 2>&1; then
+              return 0
+            fi
+            "$PB" -c "Add :$K dict" "$PLIST" 2>/dev/null || true
+            "$PB" -c "Add :$K:CFBundlePrimaryIcon dict" "$PLIST" 2>/dev/null || true
+            "$PB" -c "Add :$K:CFBundlePrimaryIcon:CFBundleIconFiles array" "$PLIST" || true
+            "$PB" -c "Add :$K:CFBundlePrimaryIcon:CFBundleIconFiles:0 string AppIcon60x60" "$PLIST" || true
+            "$PB" -c "Add :$K:CFBundlePrimaryIcon:CFBundleIconFiles:1 string AppIcon76x76" "$PLIST" || true
+            "$PB" -c "Add :$K:CFBundlePrimaryIcon:CFBundleIconFiles:2 string AppIcon83.5x83.5" "$PLIST" || true
+          }
+          ICON_OK=0
+          if xcrun actool --compile "$APP" --platform iphoneos \
+               --minimum-deployment-target 16.0 --app-icon AppIcon \
+               --target-device iphone --target-device ipad \
+               --output-partial-info-plist /tmp/icon.plist \
+               "$ICONSRC/Assets.xcassets" \
+             && test -f "$APP/Assets.car" && test -s /tmp/icon.plist; then
+            "$PB" -c 'Delete :CFBundleIcons' "$PLIST" 2>/dev/null || true
+            "$PB" -c 'Delete :CFBundleIcons~ipad' "$PLIST" 2>/dev/null || true
+            if "$PB" -c "Merge /tmp/icon.plist" "$PLIST"; then
+              ICON_OK=1
+            fi
+          fi
+          if [ "$ICON_OK" != 1 ]; then
+            echo "actool or merge failed: loose PNG icons with explicit keys"
+            "$PB" -c 'Delete :CFBundleIcons' "$PLIST" 2>/dev/null || true
+            "$PB" -c 'Delete :CFBundleIcons~ipad' "$PLIST" 2>/dev/null || true
+          fi
+          # actool's single-size icon may list no files: LiveContainer and
+          # sideload tools read CFBundleIconFiles, so make sure it exists.
+          add_icon_files CFBundleIcons
+          add_icon_files 'CFBundleIcons~ipad'
+          echo "icon files in the app:"
+          ls "$APP" | grep -i -E "assets.car|appicon" || true
+          echo "icon keys in Info.plist:"
+          "$PB" -c 'Print :CFBundleIcons' "$PLIST" || true
+          "$PB" -c 'Print :CFBundleIcons~ipad' "$PLIST" || true
+          mkdir -p "$APP/Frameworks"
+          rm -rf "$APP/Frameworks/MoltenVK.framework"
+          cp -R "$MVK_FW" "$APP/Frameworks/"
+          /usr/libexec/PlistBuddy -c 'Add :NSAppTransportSecurity dict' "$PLIST" 2>/dev/null || true
+          # ad-hoc sign so SideStore/ldid only re-signs
+          /usr/bin/codesign --force --sign - --deep "$APP/Frameworks/MoltenVK.framework" || true
+          /usr/bin/codesign --force --sign - "$APP" || true
+          rm -rf Payload "$GAME_UP-unsigned.ipa"
+          mkdir Payload && cp -R "$APP" Payload/
+          zip -qr "$GAME_UP-unsigned.ipa" Payload
+          ls -la "$GAME_UP-unsigned.ipa"
+
+      - name: Version + rename IPA
+        if: success()
+        run: |
+          VER="${BUILD_TAG:-v$GITHUB_RUN_NUMBER}_$(git rev-parse --short HEAD)"
+          mv "$GAME_UP-unsigned.ipa" "$GAME_UP-${VER}.ipa"
+          echo "IPA_NAME=$GAME_UP-${VER}.ipa" >> "$GITHUB_ENV"
+
+      # The IPA holds the game's code. Only people with read access to this
+      # private repository can download it.
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: ${{ env.GAME_UP }}-ipa
+          path: ${{ env.GAME_UP }}-*.ipa
+          retention-days: 3
