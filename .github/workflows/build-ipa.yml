@@ -377,6 +377,7 @@ jobs:
           BIN="build/${GAME}_recomp"
           [ -f "$BIN" ] || BIN="build/${GAME}_recomp.app/${GAME}_recomp"
           echo "build tag: $TAG"
+          echo "BUILD_TAG=$TAG" >> "$GITHUB_ENV"
           test "$(strings "$BIN" | grep -c -F "build $TAG (")" -gt 0
 
       - name: ccache stats
@@ -503,7 +504,7 @@ jobs:
       - name: Version + rename IPA
         if: success()
         run: |
-          VER="v${GITHUB_RUN_NUMBER}_$(git rev-parse --short HEAD)"
+          VER="${BUILD_TAG:-v$GITHUB_RUN_NUMBER}_$(git rev-parse --short HEAD)"
           mv "$GAME_UP-unsigned.ipa" "$GAME_UP-${VER}.ipa"
           echo "IPA_NAME=$GAME_UP-${VER}.ipa" >> "$GITHUB_ENV"
 

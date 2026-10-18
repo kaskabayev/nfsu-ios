@@ -219,11 +219,13 @@ it builds the app on a macOS runner and gives you an unsigned IPA. You need a
 
 Notes:
 
-- The lift runs on Linux and takes about 10 minutes. The iOS build runs on
-  macOS.
+- The lift runs on Linux and takes about 4 minutes. The iOS build runs on
+  macOS. It takes about 4 minutes the first time, and about 1 minute later,
+  when the libraries come from the cache.
 - A private repository uses the Actions minutes of your account. One macOS
-  minute counts as 10 minutes. The macOS job takes about MACOS_MINUTES_TBD
-  minutes.
+  minute counts as 10 minutes. So the first build uses about 45 minutes of
+  your quota, and a later build about 15. (Measured on GitHub-hosted runners
+  in October 2026. The free plan gives 2000 minutes per month.)
 - The workflow compares the SHA-256 of your XBE with the value in
   `games/<game>/game_profile.h`. It stops if they differ.
 - The workflow refuses to run in a public repository. The lifted code and the
