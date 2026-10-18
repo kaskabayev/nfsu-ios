@@ -3,7 +3,8 @@
 Environment variables of the runtime. The text and the tables come from the
 README of the upstream project
 ([antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw), Anton
-Artemov, at 6e19726) and were extended for this fork. Keys that start with
+Artemov, at 6e19726; the tree includes upstream up to 0.5.13) and were
+extended for this fork. Keys that start with
 `NFSU2_` apply to NFSU1 as well; the key names did not change. Most keys are for
 debugging. The defaults are the normal configuration.
 
@@ -59,6 +60,8 @@ RECOMP_WIDESCREEN=0
 | `NFSU2_MOVIE_FLASH=1` | Keep the opening trailer's white flash frames (shown black by default). |
 | `NFSU2_SWITCH_TEXT` | Switch wording in the menus (Start → +, no Xbox Live/hard-disk names): 1 on (Switch default), 0 off. |
 | `NFSU2_EXIT_TRACE=1` | Print the guest state at exit. |
+| `NFSU2_OPTIONS=0` | NFSU2: no in-game option rows (Car Reflections, Resolution Scale, Anisotropic, Vibration), no `nfsu2x_options.txt`, no audio volume restore, no option labels. Default 1. |
+| `RECOMP_OPTION_SCALE=1\|0` | NFSU2, Vulkan: the Resolution Scale row decides the render scale (1) or `RECOMP_GL_SCALE` does and the row is hidden (0). Default 1; 0 on iOS. |
 | `RECOMP_WIDESCREEN=0` | Tell the game the TV is 4:3 (default 16:9). |
 | `RECOMP_CMDLINE` | Command line handed to the title (e.g. `+map intro`). |
 | `HOME`, `XDG_DATA_HOME` | Linux: fallback save directory (`$XDG_DATA_HOME/xboxrecomp`, else `~/.local/share/xboxrecomp`) when none is configured. NFSU2's own saves go to `<game>/UDATA`. |
@@ -80,6 +83,9 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_NX_JOYCON=single` | One sideways Joy-Con per player. |
 | `RECOMP_NX_JOYCON_ROTATE=0` | Don't rotate the sideways Joy-Con stick. |
 | `RECOMP_GUEST_ONE_CORE` | 1 = pin guest threads to one core, 2 = guest threads only (interrupts float). |
+| `NFSU2_CPU_MHZ`, `NFSU2_GPU_MHZ`, `NFSU2_MEM_MHZ` | Clock requests in MHz (opt-in). Ignored while sys-clk or Horizon OC runs; a rate already at or above the request is left alone. |
+| `NFSU2_CLOCK_FORCE=1` | Apply the `NFSU2_*_MHZ` lines even when sys-clk or Horizon OC is running. |
+| `NFSU2_SALTYNX=0` | Do not report the frame rate to SaltyNX (Status Monitor FPS). |
 
 </details>
 
@@ -124,7 +130,11 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_GL_TRACE=1` | Shader sources and compile/link errors. |
 | `RECOMP_GL_FINISH=1` | Wait for the GPU after every operation (finds the call that hangs it). |
 | `RECOMP_FPS_LOG=1` | Presented frames per 10 s. |
-| `RECOMP_VK_CUBE=0` | Vulkan: no cube maps (car reflections off). |
+| `RECOMP_VK_CUBE=0` | Vulkan: no cube maps (car reflections off). The in-game Car Reflections row does the same at run time. |
+| `RECOMP_VK_SNAP=1\|0` | Vulkan vertex snap: 1 puts each position where a title edge there would land, per axis; 0 shifts both axes by one constant (the rule before 0.5.13). They differ at render scales of 2 and up. Default 1; 0 on iOS and in NFSU1. |
+| `RECOMP_PB_RUN=1\|0` | Take vertex-constant and index runs of the pushbuffer in one loop and skip the per-word survey. Default 1; 0 on iOS and in NFSU1. |
+| `RECOMP_VK_DUMP_ALL=1` | With `RECOMP_GL_DUMP`: dump every surface too, as `<prefix><frame>_<va>.bmp`. |
+| `RECOMP_DRAW_MERGE_STATS=1` | With `RECOMP_DRAW_STATS=1`: also survey draws that match the previous one (hashes every index; slow). |
 | `RECOMP_VK_HEADLESS=1` | Vulkan on Linux: no window (also implied by `SDL_VIDEODRIVER=offscreen`). |
 | `RECOMP_VK_VALIDATION=1` | Vulkan on Linux: Khronos validation layer. |
 | `RECOMP_VK_TRACE=<n>` | Vulkan: name every step of the first n draws/clears/flips. |
@@ -133,6 +143,12 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_FB_DUMP=<prefix>`, `RECOMP_FB_WINDOW=1`, `RECOMP_FB_VA=<va>`, `RECOMP_FB_WINDOW_DUMP_EVERY=<n>` | Framebuffer window / dumps (CPU presenter). |
 | `RECOMP_FFP_TRACE`, `RECOMP_SKIP_TRACE`, `RECOMP_TRACE_FLIP=<n>`, `RECOMP_PB_EXEC_VERBOSE`, `RECOMP_PB_UNHANDLED_ALL`, `RECOMP_PB_SCAN`, `RECOMP_NV2A_TRACE`, `RECOMP_RASTER_TEST`, `RECOMP_FIND_NAN`, `RECOMP_FIND_QUAD` | Pushbuffer / NV2A debugging traces. |
 | `RECOMP_FMV_HOST`, `RECOMP_FMV_DUMP=<prefix>` | Host-side movie player (off) and movie frame dumps. |
+
+
+Upstream 0.5.13 keys that this tree does not build yet (the renderer parts are
+not ported; see the CHANGELOG): `RECOMP_VK_FXAA`, `RECOMP_VK_SQUARE`,
+`RECOMP_GL_SCALE_X`, `RECOMP_VK_NAT`, `RECOMP_VK_SYNC`,
+`RECOMP_VK_ASYNC_PRESENT`, `RECOMP_VK_STATE_CACHE`. Setting them does nothing.
 
 </details>
 

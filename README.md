@@ -13,8 +13,9 @@ GPU, the sound chip and the USB pads. There is no emulator.
 
 This tree is based on the upstream Switch/Linux port
 [antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw) at commit
-6e19726 (version 0.5). Upstream has moved on since then. For newer Switch
-builds, use upstream. See [CREDITS.md](CREDITS.md) for everyone whose work is
+6e19726 (version 0.5) and includes upstream up to d3bbc30 (version 0.5.13).
+Some renderer changes of 0.5.12 and 0.5.13 are not merged yet (see
+[CHANGELOG.md](CHANGELOG.md)). See [CREDITS.md](CREDITS.md) for everyone whose work is
 in this tree.
 
 ## Read this first
@@ -42,6 +43,9 @@ in this tree.
   60 fps race mode, and options to reduce heat.
 - NFSU2: widescreen 16:9 with the game's own wide mode. Full-screen intro
   movies. Two-player split screen on the Switch.
+- NFSU2: in-game options for car reflections, resolution scale, anisotropic
+  filtering and vibration strength; the audio volumes are kept across
+  launches (`nfsu2x_options.txt`, see [docs/SETTINGS.md](docs/SETTINGS.md)).
 - Disc images are read directly (XISO and Redump layouts). You do not need to
   unpack the disc on iOS.
 - Audio through an emulated Xbox sound chip (APU).

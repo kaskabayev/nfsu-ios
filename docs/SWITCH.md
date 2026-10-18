@@ -35,6 +35,7 @@ extracted (`default.xbe`, `NFSUNDER/`, ...).
 sdmc:/switch/nfsu2x/
 ├── nfsu2x-vulkan.nro
 ├── nfsu2x_env.txt      optional settings, KEY=VALUE per line
+├── nfsu2x_options.txt  written by the in-game options (see below)
 └── game/
     ├── default.xbe
     └── ...
@@ -42,6 +43,17 @@ sdmc:/switch/nfsu2x/
 
 Buttons map by label (Switch A = Xbox A). Settings go in `nfsu2x_env.txt`
 (see [SETTINGS.md](SETTINGS.md)) and the log is written to the same folder.
+
+NFSU2 has its own rows in the game's Options menu: Video has Car Reflections
+(On/Off), Resolution Scale (1x to 2.5x; applies at the next start) and
+Anisotropic (a cap: Off to 16x); Gameplay has Vibration (Off, 10% to 100%).
+The Audio volumes are kept across launches. All of it is stored in
+`nfsu2x_options.txt` (`reflections=`, `scale=`, `aniso=`, `vibration=` and one
+key per volume, 0 to 1). `NFSU2_OPTIONS=0` turns the rows and the file off.
+Anti-Aliasing and Square Pixels rows of upstream 0.5.13 are not in this tree
+yet. The Switch reports its frame rate to SaltyNX (Status Monitor);
+`NFSU2_SALTYNX=0` turns that off. When sys-clk or Horizon OC runs, the
+`NFSU2_*_MHZ` lines are ignored (`NFSU2_CLOCK_FORCE=1` overrides).
 
 ## Building the NRO
 

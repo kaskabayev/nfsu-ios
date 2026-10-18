@@ -189,8 +189,8 @@ older text below that says `src/recomp_manual.c` means
   edge still missed it. `u_surf.w` = 0.5 - 0.5*w/pw shifts positions so
   each title pixel's first real centre sits on i + 0.5. A/B at 2x: real
   row/column 1 mean 170 vs 30 without, flat with.
-  At k >= 2 no constant shift fits every edge (fixed 2026-10-19, v0.5.13,
-  VK only): square pixels at 1.5x store 2x columns, and an edge on a whole
+  At k >= 2 no constant shift fits every edge (fixed upstream in 0.5.13,
+  VK only; here `RECOMP_VK_SNAP`, off on iOS and in NFSU1): square pixels at 1.5x store 2x columns, and an edge on a whole
   title pixel landed on the centre of the last real column it should cover
   -> the motion blur's 320x240 copies (0x82EBA380/0x82F05400 ring) lost
   their last column, and the blur pulled black in at the right of the
@@ -275,7 +275,7 @@ older text below that says `src/recomp_manual.c` means
   grows, draws are scissored to the clip (like xemu), and a render target
   sampled as a smaller texture gets its texcoords scaled (`rt_scale`).
   Menu dumps run ~60 frames/s: RECOMP_GL_DUMP=<p>,61 is about one a second.
-- **Audio volumes not kept (issue #21, fixed 2026-10-13, recomp_manual.c
+- **Audio volumes not kept (upstream #21, fixed 2026-10-13, recomp_manual.c
   sub_00076A70 wrapper):** the Xbox game never saves them. The six
   sliders are floats in the options object 0x406CA0 (block at 0x406CE8:
   menu music +0x08, game music +0x0C, speech +0x04, sfx +0x10, tires
@@ -431,6 +431,15 @@ older text below that says `src/recomp_manual.c` means
   straight into the ring, vertex input re-sent only on change. Merged by
   taking NFSU1's nv2a_vk.c and re-adding NFSU2's stored_size/
   rescale_surfaces/nv2a_vk_scale_pct and nv2a_vk_cube_maps.
+  In this tree (v34) only part of this is present: Resolution Scale (read
+  once when the renderer starts, so a change applies at the next launch;
+  `RECOMP_OPTION_SCALE=0`, the iOS default, leaves the scale to
+  `RECOMP_GL_SCALE` and hides the row) and Anisotropic (a cap on the
+  renderer's own level; 16x caps nothing). FXAA, square pixels,
+  `RECOMP_GL_SCALE_X`, runtime `rescale_surfaces`, early Z (`RECOMP_VK_NAT`),
+  fewer barriers, the state cache and async present are not ported; their
+  rows (`NFSU2_FXAA_ROWS`) and keys do not exist here. `NFSU2_OPTIONS=0`
+  turns all option rows, the options file and the option labels off.
   Options -> Video rows (recomp_manual.c s_rows, Vulkan build only):
   Anti-Aliasing Off/On (nv2a_vk_fxaa), Anisotropic Off/2x/4x/8x/16x
   (nv2a_vk_aniso; level in sampler key bits 20..24), Square Pixels Off/On
@@ -444,7 +453,7 @@ older text below that says `src/recomp_manual.c` means
   Colour_Calibration_Backing) covered list rows 5+: hidden after the
   screen is built (sub_00118CE0). Menu path on Linux: Main Menu -> right
   until Options (last, no wrap) -> a -> right (Video) -> a.
-- **Neon through the car (issue #32, 0.5.5-0.5.8, fixed 2026-10-14):**
+- **Neon through the car (upstream #32, 0.5.5-0.5.8, fixed 2026-10-14):**
   Square Pixels widened surfaces by AA mode (aa_sx 1 -> 4/3 columns), but
   depth_get keys depth by zeta *and* stored size. The garage draws the car
   into the 1280x480 aa 2x1 back buffer and the neon into a 1280-wide target
@@ -454,24 +463,28 @@ older text below that says `src/recomp_manual.c` means
   option's scale (nv2a_vk_scale_pct, 1.5x default) instead of 1x + a
   rescale at the first flip. Square Pixels also gives surfaces >= 1280
   wide 2/3 of the scale (2026-10-18): the 1280x480 aa 2x1 front end was
-  1920x720 at 1.5x, now 1280x720 like the races (FlatOut 2: by aa_sx). Console save with the neon 240SX:
-  /root/nfsu2x/game_neon (Career -> Resume Career -> right x2 -> car select).
-- **Races/open world uncapped (2026-10-14, v0.5.9, recomp_manual.c
-  sub_002F22F0 wrapper):** NFSU2 sets D3D's presentation interval
+  1920x720 at 1.5x, now 1280x720 like the races (FlatOut 2: by aa_sx). Test path: a save with the neon 240SX,
+  Career -> Resume Career -> right x2 -> car select.
+- **Races/open world above 30 fps (this tree: swap wrappers; upstream
+  0.5.9 used the PGRAPH handler):** NFSU2 sets D3D's presentation interval
   (0x2F76FC) to 2 there; Present (sub_002EB4B0/002EB6A0) packs it into the
   flip NOP trap word, (bits << 5) | 1 (bits 1/2/3 = 1/2/4 vblanks, 8 =
   immediate when late), and sub_002F2080 case 1 schedules the flip that many
-  vblanks after the last. The PGRAPH wrapper rewrites the interval in
-  TRAPPED_DATA to 1 -> up to 60 fps. `NFSU2_FPS_CAP=30` keeps the title's.
-  Log `[fps] flip interval 2 -> 1 vblank (uncapped)`. Console confirmed.
-  Scripted camera sequences (NIS: race intro, entering/leaving shops)
-  step per frame and ran 2x fast uncapped (fixed 2026-10-19, v0.5.13):
-  the sequence object 0x38DBA0 has three "playing" slots +0x10/+0x28/+0x40
-  (sub_0003F540/sub_0003F760; found by diffing .data over a race intro);
-  while one is set the title's interval stays (`nis_playing`, log
-  `[fps] camera sequence playing/over`, NFSU2_NIS_CAP=0 off). Race intro
-  checked on Linux; shops on the console.
-- **Renderer optimisations from PR #26 (2026-10-18, v0.5.12, nv2a_vk.c):**
+  vblanks after the last. With `RECOMP_PRESENT_INTERVAL=1` the two swap
+  wrappers rewrite the interval at 0x2F76FC to 1 before the swap
+  (`force_interval`, so 60 fps at most) and put the title's value back
+  (`unforce_interval`) in cutscenes (`RECOMP_DT_FLOOR=auto`, the game's time
+  floor above 1/60) and when `xbox_power_hot_cap()` says the phone is hot.
+  Upstream instead rewrote the interval in TRAPPED_DATA inside the
+  sub_002F22F0 wrapper (`NFSU2_FPS_CAP=30` to keep 30) and kept scripted
+  camera sequences (NIS: race intro, entering and leaving shops) at 30 by
+  the "playing" slots of the sequence object 0x38DBA0 (+0x10/+0x28/+0x40,
+  words 0x38DBB0/0x38DBC8/0x38DBE0; `NFSU2_NIS_CAP=0`). That rewrite is not
+  in this tree: it runs after the swap wrappers and would undo the hot cap.
+  Our cutscene test is the time floor; the NIS slots are a second signal if a
+  camera sequence ever runs fast. Race intro checked on Linux upstream;
+  shops on the console.
+- **Renderer optimisations from upstream PR #26 (2026-10-18, v0.5.12, nv2a_vk.c; not in this tree, see CHANGELOG "not yet ported"):**
   (1) draws with the alpha test off/ALWAYS use a fragment shader without its
   discard (`nv2a_gl_psh_no_alpha_test`, PipeKey.nat, made on first use;
   vkpipes.bin records it in the old pad word) -> early Z; RECOMP_VK_NAT=0.
@@ -1016,7 +1029,7 @@ older text below that says `src/recomp_manual.c` means
   system's clocks (2026-10-08, NFSU2 + Carbon): the keeper thread ran at
   0x3F and busy guest threads (0x3B) starved it; now 0x2C, plus an applet
   hook (focus/dock/perf mode/resume) that re-checks every 250 ms for 5 s.
-  Issue #25 (2026-10-13): Horizon OC (service "hoc:clk", sys-clk fork,
+  Upstream #25 (2026-10-13): Horizon OC (service "hoc:clk", sys-clk fork,
   same TID 00FF0000636C6BFF) puts stock rates back every tick when the game
   has no profile -> clock fight, console froze after ~11 min. Now: if
   hoc:clk or sys:clk is registered (smRegisterService fails with 0x815)
