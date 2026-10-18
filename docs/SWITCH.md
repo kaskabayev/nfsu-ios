@@ -45,8 +45,9 @@ Buttons map by label (Switch A = Xbox A). Settings go in `nfsu2x_env.txt`
 (see [SETTINGS.md](SETTINGS.md)) and the log is written to the same folder.
 
 NFSU2 has its own rows in the game's Options menu: Video has Car Reflections
-(On/Off), Resolution Scale (1x to 2.5x; applies at the next start) and
-Anisotropic (a cap: Off to 16x); Gameplay has Vibration (Off, 10% to 100%).
+(On/Off) and, in the Vulkan build only, Resolution Scale (1x to 2.5x; applies
+at the next start) and Anisotropic (a cap: Off to 16x); Gameplay has Vibration
+(Off, 10% to 100%).
 The Audio volumes are kept across launches. All of it is stored in
 `nfsu2x_options.txt` (`reflections=`, `scale=`, `aniso=`, `vibration=` and one
 key per volume, 0 to 1). `NFSU2_OPTIONS=0` turns the rows and the file off.

@@ -476,10 +476,10 @@ older text below that says `src/recomp_manual.c` means
   (`unforce_interval`) in cutscenes (`RECOMP_DT_FLOOR=auto`, the game's time
   floor above 1/60) and when `xbox_power_hot_cap()` says the phone is hot.
   Upstream instead rewrote the interval in TRAPPED_DATA inside the
-  sub_002F22F0 wrapper (`NFSU2_FPS_CAP=30` to keep 30) and kept scripted
+  sub_002F22F0 wrapper and kept scripted
   camera sequences (NIS: race intro, entering and leaving shops) at 30 by
   the "playing" slots of the sequence object 0x38DBA0 (+0x10/+0x28/+0x40,
-  words 0x38DBB0/0x38DBC8/0x38DBE0; `NFSU2_NIS_CAP=0`). That rewrite is not
+  words 0x38DBB0/0x38DBC8/0x38DBE0). That rewrite is not
   in this tree: it runs after the swap wrappers and would undo the hot cap.
   Our cutscene test is the time floor; the NIS slots are a second signal if a
   camera sequence ever runs fast. Race intro checked on Linux upstream;

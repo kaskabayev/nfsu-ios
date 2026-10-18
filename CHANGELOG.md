@@ -24,7 +24,7 @@ tree keeps its own renderer file and does not have them yet:
 - the texture cache key by pitch, mip levels, format and palette, and the DXT
   mip levels in the texture hash (upstream 0.5.10);
 - the motion blur edge change for square pixels (0.5.13);
-- upstream's rewrite of the flip interval (`NFSU2_FPS_CAP`, `NFSU2_NIS_CAP`):
+- upstream's rewrite of the flip interval in the PGRAPH handler and its camera-sequence exception:
   our swap wrappers keep deciding the 60 fps races and the hot 30 fps cap.
 
 ## NFSU1 (iOS and Linux)
