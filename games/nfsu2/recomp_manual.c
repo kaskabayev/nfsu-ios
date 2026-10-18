@@ -586,11 +586,95 @@ static void swap_pre(uint32_t slot)
     }
 }
 
+/* ── Time step histogram at each swap ─────────────────────────
+ *
+ * Read-only, in every mode (swap_pre only runs with RECOMP_PRESENT_INTERVAL=1).
+ * The time step has just stored this frame's N at 0x4289B4. Its clock is the
+ * game's rdtsc "QueryPerformanceCounter" (733 MHz, steps far below 1 ms), so
+ * N follows the real frame time: 120 per frame at 30 fps, 60 at 60 fps.
+ * Every 10 s: swaps, N min/max/avg, the most common values (by value) and
+ * the floor. A swap with N = 0 (no step) is counted apart and left out of
+ * min/max/avg. RECOMP_DT_HIST=0 turns it off. */
+#define DT_HIST_N   384                 /* values 0..383 (the step cap is 360); more go in the last slot */
+#define DT_HIST_TOP 8                   /* values printed */
+
+static void dt_hist(void)
+{
+    static int on = -1;
+    static unsigned cnt[DT_HIST_N + 1], swaps, n0;
+    static uint64_t nsum;
+    static int32_t nmin, nmax;
+    static double t0;
+    struct timespec ts;
+    double now;
+    int32_t n;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_DT_HIST");
+        on = !(e && strcmp(e, "0") == 0);
+    }
+    if (!on)
+        return;
+    n = (int32_t)MEM32(0x4289B4u);
+    swaps++;
+    if (n <= 0) {
+        n0++;
+    } else {
+        if (nsum == 0 || n < nmin)
+            nmin = n;
+        if (n > nmax)
+            nmax = n;
+        nsum += (uint32_t)n;
+        cnt[n < DT_HIST_N ? n : DT_HIST_N]++;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (t0 == 0.0)
+        t0 = now;
+    if (now - t0 >= 10.0) {
+        char pick[DT_HIST_N + 1] = { 0 }, line[384];
+        unsigned frames = swaps - n0;
+        int k, i, len;
+
+        /* One write, so other threads' log lines do not cut it. */
+        len = snprintf(line, sizeof line,
+                       "[dt] 10 s: %u swaps, ticks/frame min %d max %d avg %.2f, spread:",
+                       swaps, nmin, nmax, frames ? (double)nsum / frames : 0.0);
+        for (k = 0; k < DT_HIST_TOP; k++) {
+            int best = -1;
+            for (i = 0; i <= DT_HIST_N; i++)
+                if (!pick[i] && cnt[i] && (best < 0 || cnt[i] > cnt[best]))
+                    best = i;
+            if (best < 0)
+                break;
+            pick[best] = 1;
+        }
+        for (i = 0; i <= DT_HIST_N; i++)
+            if (pick[i]) {
+                if (i == DT_HIST_N)
+                    len += snprintf(line + len, sizeof line - len, " >%d:%u", DT_HIST_N - 1, cnt[i]);
+                else
+                    len += snprintf(line + len, sizeof line - len, " %d:%u", i, cnt[i]);
+            }
+        if (n0)
+            len += snprintf(line + len, sizeof line - len, ", N0 %u", n0);
+        snprintf(line + len, sizeof line - len, ", floor %.6f\n", dt_f32(MEM32(0x428EE8u)));
+        fputs(line, stderr);
+        memset(cnt, 0, sizeof cnt);
+        swaps = n0 = 0;
+        nsum = 0;
+        nmin = nmax = 0;
+        t0 = now;
+    }
+}
+
 static void unimpl_tick(void);
 
 void sub_002EB4B0(void)
 {
     unimpl_tick();
+    dt_hist();
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
     sub_002EB4B0_gen();
@@ -599,6 +683,7 @@ void sub_002EB4B0(void)
 void sub_002EB6A0(void)
 {
     unimpl_tick();
+    dt_hist();
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
     sub_002EB6A0_gen();
