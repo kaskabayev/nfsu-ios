@@ -192,11 +192,48 @@ Vulkan-Headers 1.3.296 and the MoltenVK 1.4.2 framework. Then wrap
 `build-ios/nfsu2_recomp.app` into an unsigned IPA, with the icons from
 `games/nfsu2/ios/`. Sideloading tools sign it when they install it.
 
-If you have no Mac, you can build on GitHub Actions. Use a **private**
-copy of this repository, because the workflow needs your lifted C, and that
-must never be public. A workflow for the full iOS build is planned and is not
-in this repository yet. The file `.github/workflows/ios-feasibility.yml`
-only builds the runtime libraries for iOS. It needs no game files.
+If you have no Mac, build on GitHub Actions. See the next section.
+The file `.github/workflows/ios-feasibility.yml` only builds the runtime
+libraries for iOS. It needs no game files.
+
+### Build the IPA on GitHub Actions
+
+The workflow `build-ipa` lifts your own `default.xbe` on a Linux runner. Then
+it builds the app on a macOS runner and gives you an unsigned IPA. You need a
+**private** repository, because the lifted C is the game's code.
+
+1. Make a private repository. A fork of a public repository cannot be
+   private, so create a new private repository on GitHub. Then run:
+   ```sh
+   git clone https://github.com/kaskabayev/nfsu-ios.git && cd nfsu-ios
+   git remote set-url origin <your private repo>
+   git push -u origin main
+   ```
+2. Take `default.xbe` out of your disc image (see "Get the tools" above,
+   `tools.xiso get`). Rename it to `nfsu2.xbe` or `nfsu1.xbe`.
+3. In the private repository, create a release with the tag `xbe`. Attach the
+   file. (A release of a private repository is private.)
+4. Open Actions > build-ipa > Run workflow. Pick the game. Download the IPA
+   artifact when the run is done. Install it as described in "Install on
+   iPhone or iPad".
+
+Notes:
+
+- The lift runs on Linux and takes about 10 minutes. The iOS build runs on
+  macOS.
+- A private repository uses the Actions minutes of your account. One macOS
+  minute counts as 10 minutes. The macOS job takes about MACOS_MINUTES_TBD
+  minutes.
+- The workflow compares the SHA-256 of your XBE with the value in
+  `games/<game>/game_profile.h`. It stops if they differ.
+- The workflow refuses to run in a public repository. The lifted code and the
+  IPA hold the game's code. In a public repository, everyone could download
+  them.
+- The lifted code is kept as an artifact for 1 day. The IPA is kept for 3
+  days.
+- Optional inputs: `xbe_release` (another release tag) and `bundle_id`
+  (default `io.github.<owner>.<game>`).
+- Never upload the lifted code, the IPA or the XBE to a public place.
 
 ### 3c. Build for Nintendo Switch
 
@@ -283,6 +320,7 @@ which device and which iOS version you use. Do not attach game files.
 | `src/` | shared startup code, iOS launch screen, movie decoder, Switch layer |
 | `xboxrecomp/` | the toolkit: lifter, runtime, renderers, with this project's changes |
 | `tools/` | `lift.sh` (lift a game), `make_art.py` (draws the icons), tests |
+| `.github/` | issue template and workflows: `build-ipa.yml` (IPA from your own game file), `ios-feasibility.yml` (runtime libraries only) |
 | `switch/` | Switch build script |
 | `docs/` | developer notes, performance notes, Switch notes, settings reference |
 
