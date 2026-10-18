@@ -22,6 +22,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "game_profile.h"
+
+#if NFSU_HAS_OPTIONS
+int nfsu2_options_on(void);     /* recomp_manual.c: NFSU2_OPTIONS */
+#endif
+
 /* kernel_file.c */
 extern void (*xbox_file_read_hook)(void *buf, size_t len, int64_t offset);
 
@@ -216,5 +222,11 @@ void nfsu2_text_patch_init(void)
     int on = e && e[0] == '1';
 #endif
     s_switch_words = on;
-    xbox_file_read_hook = on_read;
+#if NFSU_HAS_OPTIONS
+    /* The option labels (s_always) belong to the port's options. */
+    if (nfsu2_options_on())
+        on = 1;
+#endif
+    if (on)
+        xbox_file_read_hook = on_read;
 }

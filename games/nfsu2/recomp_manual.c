@@ -2112,6 +2112,18 @@ void sub_0033518D(void)
 #else
 #  define NFSU2_OPTIONS_FILE "nfsu2x_options.txt"
 #endif
+/* NFSU2_OPTIONS=0 turns the whole feature off: no rows, no options file, no
+ * option labels (text_patch.c), the Video screen as the title builds it. */
+int nfsu2_options_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("NFSU2_OPTIONS");
+        v = !(e && *e == '0');
+    }
+    return v;
+}
+
 #define FE_PAD_LEFT     0x9120409Eu
 #define FE_PAD_RIGHT    0xB5971BF1u
 #define ROW_VTABLE      0x0034EFD0u     /* Speedometer Units */
@@ -2285,8 +2297,14 @@ static void options_log(void)
 void nfsu2_options_load(void)
 {
     char line[128];
-    FILE *f = fopen(NFSU2_OPTIONS_FILE, "r");
+    FILE *f;
     int i;
+
+    if (!nfsu2_options_on()) {
+        fprintf(stderr, "[options] off (NFSU2_OPTIONS=0)\n");
+        return;
+    }
+    f = fopen(NFSU2_OPTIONS_FILE, "r");
 
     if (f) {
         while (fgets(line, sizeof line, f)) {
@@ -2455,6 +2473,8 @@ void sub_000CE8D0(void)
     int i;
 
     sub_000CE8D0_gen();
+    if (!nfsu2_options_on())
+        return;
     for (i = 0; i < 3; i++) {
         PUSH32(esp, s_colorcal_names[i]);   /* name hash, cdecl */
         PUSH32(esp, 0x000CE9A5u);
@@ -2479,7 +2499,8 @@ void sub_000CEA00(void)
     uint32_t screen = ecx;
 
     sub_000CEA00_gen();
-    add_rows(screen, 1);
+    if (nfsu2_options_on())
+        add_rows(screen, 1);
 }
 
 /* Row refresh (thiscall): label and value text. */
@@ -2553,6 +2574,10 @@ void sub_00076A70(void)
     uint32_t blk = MEM32(esp + 4);
     int i, restored = 0, changed = 0;
 
+    if (!nfsu2_options_on()) {
+        sub_00076A70_gen();
+        return;
+    }
     if (blk == AUDIO_VOLUMES && !s_vol_ready) {
         for (i = 0; i < N_VOLS; i++) {
             if (s_vol_have[i])
