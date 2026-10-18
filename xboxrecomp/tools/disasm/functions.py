@@ -650,7 +650,8 @@ class FunctionDetector:
         # `mov [edi], 0x00100A20` is "4 dwords to method 0xA20", and NFSU1's
         # .text runs through 0x00100A20 -- two such words split sub_001009C0
         # three ways, its switch lost its range check, and the race load
-        # crashed. The library takes no game function's address by value.
+        # crashed. The library takes no game function's address by value (its
+        # own functions' addresses, D3D to D3D, stay).
         d3d_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
                       for sec in sections if sec.name.upper() == "D3D"]
 
@@ -662,7 +663,9 @@ class FunctionDetector:
             target = insn.imm_ref
             if target is None or target in self.functions:
                 continue
-            if in_d3d(insn.address):
+            # D3D to D3D stays: the library keeps its own function pointers
+            # (NFSU2 sub_002F1FC0 is reached only that way).
+            if in_d3d(insn.address) and not in_d3d(target):
                 continue
             if inside_a_function(target) or not in_code_section(target):
                 continue

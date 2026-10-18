@@ -1,4 +1,5 @@
 """Weak immediate references must not split an existing instruction stream."""
+import copy
 import struct
 from tools.disasm.test_decode_at import _engine, BASE
 from tools.disasm.functions import FunctionDetector
@@ -45,11 +46,23 @@ def test_virtual_dispatch_thunk_can_realign_an_overlapping_sweep():
 
 def test_d3d_pushbuffer_word_is_not_a_function():
     # D3D stores NV2A method headers as immediates; one may equal a game
-    # address. A D3D-section source must not make it a function start.
+    # address. A D3D-section source must not make a target in .text a
+    # function start.
+    det, sec, target = detector(bytes.fromhex('558becc3'), 10)
+    d3d, text = copy.copy(sec), copy.copy(sec)
+    d3d.name, d3d.virtual_size = "D3D", 5          # the mov at BASE
+    text.name, text.virtual_addr = ".text", sec.virtual_addr + 5
+    text.virtual_size = sec.virtual_size - 5
+    det._pass_imm_ref_targets([d3d, text])
+    assert target not in det._candidates
+
+def test_d3d_function_pointer_into_d3d_stays_a_function():
+    # D3D keeps pointers to its own functions (NFSU2 sub_002F1FC0 is reached
+    # only that way). Source and target both in D3D: still a start.
     det, sec, target = detector(bytes.fromhex('558becc3'), 10)
     sec.name = "D3D"
     det._pass_imm_ref_targets([sec])
-    assert target not in det._candidates
+    assert target in det._candidates
 
 def _tail_body(jump_to_offset):
     # mov ecx,[BASE+0x100]; jmp <BASE+jump_to_offset>, placed at offset 10.
