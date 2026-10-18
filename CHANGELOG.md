@@ -39,6 +39,7 @@ tree keeps its own renderer file and does not have them yet:
 
 ## NFSU2 (iOS, Linux, Switch)
 
+- v34c: present pacing on iOS is off by default (`RECOMP_VK_PACE=1` turns it on): measured on the device, race frames were already shown for exactly two refreshes each, and pacing only added delay. The `[pace]` line still measures. NFSU2 logs a `[dt]` line every 10 s with the physics ticks per frame (`RECOMP_DT_HIST=0` turns it off).
 - v34b: the per-axis vertex snap is on by default on iOS (it removes the black and pink seams at render scale 2). Present pacing on iOS: each frame is shown at a refresh that keeps the game's own rate (`RECOMP_VK_PACE=0` turns it off, `RECOMP_VK_PACE_MS` sets the least delay), and a `[pace]` line in the log every 10 s counts the refreshes each frame stayed on screen.
 - v34: upstream 0.5.13 merged: lifter fixes (flag joins, rounding float to int, D3D to D3D function pointers, split-off stubs), one "rendered" semaphore per swapchain image, options for car reflections, resolution scale, anisotropic filtering, vibration and audio volumes (`NFSU2_OPTIONS=0` turns them off; they are off on iOS, `NFSU2_OPTIONS=1` turns them on), SaltyNX frame rate and clock manager fixes on the Switch. On iOS the bulk pushbuffer path (`RECOMP_PB_RUN`) and the per-axis vertex snap (`RECOMP_VK_SNAP`) are off, and the render scale stays with `RECOMP_GL_SCALE`.
 - v33: one tree with NFSU1, original icons.
