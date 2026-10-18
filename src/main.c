@@ -891,6 +891,17 @@ void xbox_gil_enter(void);             /* kernel_bridge.c: the guest lock */
 void xbox_gil_leave(void);
 void xbox_gil_mark_main(void);
 void nfsu2_text_patch_init(void);    /* text_patch.c: Switch button names */
+#if NFSU_HAS_OPTIONS
+void nfsu2_options_load(void);      /* recomp_manual.c: Options -> Video rows */
+#endif
+#ifndef __SWITCH__
+/* Switch's overlay reports the frame rate to SaltyNX (switch_saltynx.c); other
+ * builds have no consumer. The renderers call this after each present. */
+void nv2a_host_frame_presented(uint32_t width, uint32_t height)
+{
+    (void)width; (void)height;
+}
+#endif
 
 #ifdef __SWITCH__
 #include <pthread.h>
@@ -1481,6 +1492,9 @@ static int game_main(void)
     xbox_kernel_init();
 #if NFSU_HAS_TEXT_PATCH
     nfsu2_text_patch_init();
+#endif
+#if NFSU_HAS_OPTIONS
+    nfsu2_options_load();
 #endif
 #ifdef NFSU2_IOS
     xbox_path_init(game_dir, ios_save_dir());

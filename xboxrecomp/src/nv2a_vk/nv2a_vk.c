@@ -131,6 +131,11 @@ static VkFormat       s_sc_format;
 static VkExtent2D     s_sc_extent;
 static uint32_t       s_sc_count;
 static VkImage        s_sc_images[8];
+/* Signalled by the frame's submit, waited on by the present of the same
+ * image. Per image, not per frame: a frame's fence does not cover the
+ * presentation wait, so a per-frame semaphore could be re-signalled while
+ * the previous present still waits on it. sc_rebuild recreates them. */
+static VkSemaphore    s_sc_rendered[8];
 static int            s_headless;
 #if !defined(__SWITCH__)
 static SDL_Window    *s_win;
@@ -198,7 +203,7 @@ typedef struct {
     VkCommandBuffer pre;        /* hoisted texture uploads; submitted before cb */
     int             pre_open;   /* pre is recording */
     VkFence         fence;
-    VkSemaphore     acquired, rendered;
+    VkSemaphore     acquired;
     VkBuffer        ring;
     VkDeviceMemory  ring_mem;
     uint8_t        *ring_ptr;
@@ -370,6 +375,15 @@ typedef struct {
 
 #define VK_MAX_SURF 32
 #define VK_MAX_DEPTH 16
+
+/* Car reflections on/off at run time (NFSU2: Options -> Video); off makes
+ * the cube stages sample the black dummy, like RECOMP_VK_CUBE=0. */
+volatile int nv2a_vk_cube_maps = 1;
+
+/* Render scale asked for by a game option, in percent (NFSU2: Options ->
+ * Video, Resolution Scale); 0 = none, RECOMP_GL_SCALE decides. Read once,
+ * when the device comes up: a change takes effect at the next launch. */
+volatile int nv2a_vk_scale_pct;
 
 /* RECOMP_GL_SCALE, as in nv2a_gl: only the pixels behind a surface grow, so
  * the viewport, clear rectangles, read-backs and the present blit scale and
@@ -805,6 +819,10 @@ typedef struct {
 static int      s_mips_on = 1;
 static int      s_mips_alt;
 static uint32_t s_aniso = 1;
+/* A cap set at run time (NFSU2: Options -> Video, Anisotropic): the level
+ * used is min(s_aniso, nv2a_vk_aniso). The default 16 changes nothing;
+ * RECOMP_VK_ANISO and the device still set the level itself. */
+volatile int nv2a_vk_aniso = 16;
 static int      s_mip_log;
 static int      s_bias_force = -1;      /* RECOMP_VK_LOD_BIAS=<float>: replaces the guest's bias */
 static uint32_t s_mip_tex, s_mip_lvls, s_mip_evict;     /* per 10 s window */
@@ -1638,11 +1656,13 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], float *lodb,
     int cube = ((regs[0x1E70 / 4] >> (5 * i)) & 0x1F) == 3;
     /* RECOMP_VK_CUBE=0: cube stages sample the black dummy (no car
      * reflections, the old look). */
-    static int cube_on = -1;
-    if (cube_on < 0) {
+    static int cube_env = -1;
+    int cube_on;
+    if (cube_env < 0) {
         const char *e = getenv("RECOMP_VK_CUBE");
-        cube_on = !(e && *e == '0');
+        cube_env = !(e && *e == '0');
     }
+    cube_on = cube_env && nv2a_vk_cube_maps;
     uint32_t base = (0x1B00u + (uint32_t)i * 0x40u) / 4;
     uint32_t control0 = regs[base + 3];
     uint32_t format = regs[base + 1];
@@ -1736,8 +1756,14 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], float *lodb,
             key |= (uint64_t)lo << 20;
             key |= (uint64_t)hi << 32;
             key |= (uint64_t)(s_bias_force >= 0 ? (uint32_t)s_bias_force : (filter & 0x1FFF)) << 44;
-            if (!nearest_min && s_aniso > 1)
-                key |= (uint64_t)s_aniso << 57;
+            if (!nearest_min && s_aniso > 1) {
+                uint32_t an = s_aniso;
+                int cap = nv2a_vk_aniso;
+                if (cap < 1) cap = 1;
+                if ((uint32_t)cap < an) an = (uint32_t)cap;
+                if (an > 1)
+                    key |= (uint64_t)an << 57;
+            }
         }
         if (s_mip_log) {
             static uint32_t seen[256];
@@ -3025,6 +3051,12 @@ static int create_swapchain(void)
     }
     s_sc_count = 8;
     vkGetSwapchainImagesKHR(s_dev, s_swapchain, &s_sc_count, s_sc_images);
+    for (i = 0; i < s_sc_count; i++)
+        if (!s_sc_rendered[i]) {
+            VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            if (vkCreateSemaphore(s_dev, &sci, NULL, &s_sc_rendered[i]) != VK_SUCCESS)
+                s_sc_rendered[i] = VK_NULL_HANDLE;
+        }
     fprintf(stderr, "  [VK] swapchain %ux%u, %u images, format %d, present mode %d\n",
             s_sc_extent.width, s_sc_extent.height, s_sc_count, s_sc_format, mode);
 #ifdef NFSU2_IOS
@@ -3037,7 +3069,13 @@ static int create_swapchain(void)
  * suboptimal limiter (iOS) and the [ios-vk] line. */
 static void sc_rebuild(void)
 {
+    uint32_t i;
     vkDeviceWaitIdle(s_dev);
+    for (i = 0; i < 8; i++)
+        if (s_sc_rendered[i]) {
+            vkDestroySemaphore(s_dev, s_sc_rendered[i], NULL);
+            s_sc_rendered[i] = VK_NULL_HANDLE;
+        }
     create_swapchain();
 #ifdef NFSU2_IOS
     s_sc_last_rebuild_ns = hz_now();
@@ -3252,6 +3290,8 @@ static int ready_impl(void)
         const char *e = getenv("RECOMP_GL_SCALE");
         double k = e ? strtod(e, NULL) : 1.0;
         uint32_t m = pp.limits.maxImageDimension2D;
+        if (nv2a_vk_scale_pct >= 50)
+            k = nv2a_vk_scale_pct / 100.0;
         if (pp.limits.maxFramebufferWidth < m) m = pp.limits.maxFramebufferWidth;
         if (pp.limits.maxFramebufferHeight < m) m = pp.limits.maxFramebufferHeight;
         s_max_size = m ? m : 4096;
@@ -3500,7 +3540,6 @@ static int ready_impl(void)
         }
         vkCreateFence(s_dev, &fci, NULL, &f->fence);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->acquired);
-        vkCreateSemaphore(s_dev, &sci, NULL, &f->rendered);
         bci.size = RING_BYTES;
         bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -4101,7 +4140,7 @@ typedef struct {
     float vpoff[4];
     float aa[2];
     int32_t xform;
-    int32_t pad;
+    float snap_y;       /* nv2a_snap's offset for y; surf[3] is x's */
 } VsBlock;
 
 typedef struct {
@@ -4468,6 +4507,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
                     fprintf(stderr, "[SNAP] shift scaled to %.2fx\n", snap_k);
             }
             vb->surf[3] = (float)((0.5 - 0.5 * (double)s->w / (double)s->pw) * snap_k);
+            vb->snap_y = (float)((0.5 - 0.5 * (double)s->h / (double)s->ph) * snap_k);
         }
         memcpy(vb->m, b->composite, sizeof vb->m);
         memcpy(vb->vpoff, b->vp_offset, sizeof vb->vpoff);
@@ -4721,6 +4761,11 @@ static void dump_surface(VkSurf *s, const char *path)
     vkDestroyBuffer(s_dev, buf, NULL);
     vkFreeMemory(s_dev, mem, NULL);
 }
+
+/* The host's per-frame hook (switch_saltynx.c: the frame rate for SaltyNX
+ * overlays), with the rendered picture's size. Weak and undefined
+ * elsewhere: the call is skipped. */
+extern void nv2a_host_frame_presented(uint32_t width, uint32_t height) __attribute__((weak));
 
 static void vk_flip(void)
 {
@@ -4989,7 +5034,7 @@ static void vk_flip(void)
         si.pWaitSemaphores = &s_f->acquired;
         si.pWaitDstStageMask = &ws;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &s_f->rendered;
+        si.pSignalSemaphores = &s_sc_rendered[idx];
     }
 #ifdef NFSU2_IOS
     t_sub = hz_now();
@@ -5006,7 +5051,7 @@ static void vk_flip(void)
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         VkResult pr;
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &s_f->rendered;
+        pi.pWaitSemaphores = &s_sc_rendered[idx];
         pi.swapchainCount = 1;
         pi.pSwapchains = &s_swapchain;
         pi.pImageIndices = &idx;
@@ -5015,6 +5060,8 @@ static void vk_flip(void)
         t_pre = hz_now();
 #endif
         pr = vkQueuePresentKHR(s_queue, &pi);
+        if (nv2a_host_frame_presented)
+            nv2a_host_frame_presented(s && s_drew_any ? s->pw : 0, s && s_drew_any ? s->ph : 0);
 #ifdef NFSU2_IOS
         t_pre = hz_now() - t_pre;
         presented = 1;

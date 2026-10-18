@@ -50,5 +50,6 @@
 #define NFSU_HAS_SIM_STEP_CAP   1   /* 1/60 s cap in .data, patched at boot */
 #define NFSU_SIM_STEP_CAP_VA    0x3A4C64u
 #define NFSU_HAS_TEXT_PATCH     1   /* string-table patch (text_patch.c) */
+#define NFSU_HAS_OPTIONS        1   /* nfsu2x_options.txt + Options > Video/Audio/Gameplay rows */
 
 #endif /* NFSU_GAME_PROFILE_H */

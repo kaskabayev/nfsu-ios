@@ -53,5 +53,6 @@
  * the image), and NFSU2's string-table patch does not apply. */
 #define NFSU_HAS_SIM_STEP_CAP   0
 #define NFSU_HAS_TEXT_PATCH     0
+#define NFSU_HAS_OPTIONS        0   /* nfsu2x_options.txt + Options > Video/Audio/Gameplay rows */
 
 #endif /* NFSU_GAME_PROFILE_H */
