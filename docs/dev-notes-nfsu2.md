@@ -1,11 +1,17 @@
-# NFSU2 (Xbox) static recompilation — notes for Claude
+# NFSU2 (Xbox) static recompilation — developer notes
 
 Xbox NTSC-U Need for Speed: Underground 2, lifted to C with xboxrecomp and
-built for Linux and Nintendo Switch (libnx NRO). This repo is
-https://github.com/antoxa2584x/nfsu2-sw (`main`, commits as
-`Anton Artemov <antoxa2584@gmail.com>`). On 2026-09-29 it replaced the old PS2
-port there (history backed up in `/root/nfsu2x/nfsu2-sw-ps2-backup.bundle`).
+built for Linux, Nintendo Switch (libnx NRO) and iOS. This tree is a fork of
+https://github.com/antoxa2584x/nfsu2-sw (upstream `main` at 6e19726, 2026-10-06).
 The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
+
+Placeholders used in these notes: `$WORK` is the maintainer's work directory,
+`$GAME_DIR` the extracted disc, `$GEN_DIR` the lifted C, `<repo>` this
+checkout, `<save id>` the id of a save folder. The notes describe the
+maintainer's setup; adapt the paths. The NFSU1 game is described in
+[dev-notes-nfsu1.md](dev-notes-nfsu1.md). Game sources are in `games/<game>/`;
+older text below that says `src/recomp_manual.c` means
+`games/nfsu2/recomp_manual.c`.
 
 ## Rules
 
@@ -14,16 +20,18 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   Shared shader code (gl_psh.c/gl_vsh.c) may get VK-only paths
   (`nv2a_shader_vk`); keep the GL output unchanged.
 - Never commit game data (disc, `default.xbe`, `switch_sd/`) or generated C
-  (`gen/`). Ask before committing or pushing anything.
-- The Switch build reads the **unpacked** disc at `sdmc:/switch/nfsu2x/game/`,
-  never the ISO.
+  (`gen/`).
+- The Switch build reads the **unpacked** disc at `sdmc:/switch/nfsu2x/game/`.
+  Since v23 every build can also run from a disc image (XISO or Redump) in
+  the game dir or at `NFSU2_ISO=<path>` (`xbox_xiso.c`; `NFSU2_ISO=0` off);
+  the Switch image path (shared fd + lseek + bounce buffer) is untested.
 - Don't launch or kill Eden unless the user asked for an Eden check; check
   `tasklist.exe | grep -i eden` first. Eden's `sdmc\switch` is a junction to
-  `nfsu2-xbox\switch_sd\switch`, so an Eden run overwrites the log
+  `<repo>\switch_sd\switch`, so an Eden run overwrites the log
   there — back up a hardware log before running Eden. Use
   `run_eden.sh` (never a bare `taskkill /F`): it closes Eden politely,
   force-kills only after 15 s, and restores eden.exe/qt-config.ini from
-  `/root/nfsu2x/eden_backup/` if a hard kill damaged them. `NRO=x.nro` runs
+  `$WORK/eden_backup/` if a hard kill damaged them. `NRO=x.nro` runs
   another NRO from `switch/nfsu2x/`. The user drops real
   console logs in `switch_sd/switch/logs/`.
 - One test at a time on Linux (runs share `fb/`, `gfb/`).
@@ -39,19 +47,19 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 
 | Where | What |
 |---|---|
-| `/root/nfsu2x/` (WSL) | `game/` extracted disc, `gen/` lifted C, `build-pr128/` Linux, `build-switch/` Switch, `dis.py ADDR [+N]`, `snap.sh SECS ENV=..` (gdb stacks, `BIN=`), `run_eden.sh SECS` |
-| `xboxrecomp/` | vendored toolkit = xboxrecomp main + PR #128 + all port changes (copied from the `/root/nfsu2x/xboxrecomp-pr128` worktree; keep the two in sync) |
+| `$WORK/` (WSL) | `game/` extracted disc, `gen/` lifted C, `build-pr128/` Linux, `build-switch/` Switch, `dis.py ADDR [+N]`, `snap.sh SECS ENV=..` (gdb stacks, `BIN=`), `run_eden.sh SECS` |
+| `xboxrecomp/` | vendored toolkit = xboxrecomp main + PR #128 + all port changes (copied from the `$WORK/xboxrecomp-pr128` worktree; keep the two in sync) |
 | `src/main.c` | boot; defaults RECOMP_VBLANK=1, RECOMP_AC97_READY=plain, RECOMP_USB=1, RECOMP_PB_EXEC=1; APU at 0xFE800000 via `xbox_MmioRegister`; Switch runs the game on a 16 MB pthread |
-| `src/recomp_manual.c` | memmove ×2 (0x2A7EE0, 0x2A9450), AC97 reset 0x33518D, DSP ack wrapper 0x32EB65, D3D fence wrapper 0x2E8F20, VP6 movie frames 0x2618F0 (-> src/movie_vp6.c, FFmpeg) |
+| `games/nfsu2/recomp_manual.c` | memmove ×2 (0x2A7EE0, 0x2A9450), AC97 reset 0x33518D, DSP ack wrapper 0x32EB65, D3D fence wrapper 0x2E8F20, VP6 movie frames 0x2618F0 (-> src/movie_vp6.c, FFmpeg) |
 | `src/switch_nx.c` | log, `nfsu2x_env.txt`, exception handler, t= stamps |
 
-- Regenerate C: `tools/regen.sh` (`LIFT_ONLY=1` after manual-override edits;
+- Regenerate C: `XBE=... GEN=... tools/lift.sh nfsu2` (`LIFT_ONLY=1` after manual-override edits;
   full run after seed changes). Passes `--mmio-sections DSOUND,XPP`.
-- Switch: `XBOXRECOMP_DIR=/root/nfsu2x/xboxrecomp-pr128 bash switch/build.sh`
+- Switch: `XBOXRECOMP_DIR=$WORK/xboxrecomp-pr128 bash switch/build.sh`
   (without `XBOXRECOMP_DIR` it picks the main checkout and fails on OpenSSL).
   The copy step fails with "Permission denied" while Eden has the NRO open.
-- Linux: `cmake --build /root/nfsu2x/build-pr128 -j8`; run with
-  `NFSU2_GAME_DIR=/root/nfsu2x/game xvfb-run -a …/nfsu2_recomp`.
+- Linux: `cmake --build $WORK/build-pr128 -j8`; run with
+  `NFSU2_GAME_DIR=$GAME_DIR xvfb-run -a …/nfsu2_recomp`.
 - Menu pad script (Linux): `RECOMP_PAD_SCRIPT="10000:start:300,…,70000:start:300,80000:a:200,90000:a:200"`
   (times from the first pad read). `RECOMP_GL_DUMP=<prefix>,N` dumps frames.
 - Header changes in `templates/runtime/recomp_types.h` must be copied to
@@ -76,8 +84,8 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   `log:` devoptab (switch_nx.c) that appends to RAM with a `[  t.ttt]`
   timestamp per line; a thread writes it to the card every 0.5 s (crash
   handler drains it). Eden boot to display mode dropped 5 s → 2 s.
-- **Loading screen:** NFSU2 logo (`assets/nfsu2_logo.png`, SteamGridDB →
-  `tools/make_logo.py` → `src/nfsu2_logo.h`, RLE) + a moving bar, drawn on the
+- **Loading screen:** NFSU2 logo (`assets/nfsu2_logo.png`, drawn by
+  `tools/make_art.py` → `tools/make_logo.py` → `src/nfsu2_logo.h`, RLE) + a moving bar, drawn on the
   SDL window/GL context that the renderer then adopts
   (`nv2a_gl_adopt_window`), and kept on presents until the title's first real
   draw (`nv2a_gl_draw_placeholder`, `s_drew_any`). A libnx framebuffer can't be
@@ -110,8 +118,8 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   the translator, skipped in ISR/DPC and at IRQL ≥ DISPATCH). Pinning guest
   threads to one core (`RECOMP_GUEST_ONE_CORE=1`) also fixes it but Horizon's
   10 ms slices cost ~90% speed. Console profile for tests: copied over MTP
-  (PowerShell Shell.Application, "Цей ПК\Nintendo Switch\microSD card") into
-  `/root/nfsu2x/game/UDATA/4541005a/005413381036`.
+  (Windows Explorer or PowerShell, from the console's microSD card) into
+  `$GAME_DIR/UDATA/4541005a/<save id>`.
 - **Atmosphère fatal `std::abort()` in program 010041544D530000 (ams.mitm)**
   and whole-console freezes after save checks: leaked directory handles.
   `NtQueryDirectoryFile` kept a `DIR*` per handle and only closed it when a
@@ -261,22 +269,22 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   Shaders are gl_vsh.c/gl_psh.c with `nv2a_shader_vk = 1` (std140 blocks at
   bindings 0/1, samplers 2..5, Vulkan 0..1 clip z), compiled by glslang on a
   4 MB-stack thread. No threaded submission or loading screen yet.
-- Switch: `VULKAN=1 XBOXRECOMP_DIR=/root/nfsu2x/xboxrecomp-pr128 JOBS=6 bash
-  switch/build.sh` (build dir /root/nfsu2x/build-switch-vk). Links
-  mesa-switch's static NVK from `/root/nfsu2x/mesa-sdk/usr/local` (commit
+- Switch: `VULKAN=1 XBOXRECOMP_DIR=$WORK/xboxrecomp-pr128 JOBS=6 bash
+  switch/build.sh` (build dir $WORK/build-switch-vk). Links
+  mesa-switch's static NVK from `$WORK/mesa-sdk/usr/local` (commit
   1a8c1a66d6f + StevensND/nfsmw-nx `mesa/mesa-switch-nfsmw.patch`, built in
-  /root/nfsu2x/ref/mesa-switch: `. /root/nfsu2x/mesa-extra/env.sh; ninja -C
+  $WORK/ref/mesa-switch: `. $WORK/mesa-extra/env.sh; ninja -C
   builddir-switch src/nouveau/vulkan/libvulkan.a; meson install -C
-  builddir-switch --destdir /root/nfsu2x/mesa-sdk` -- the cross/native files
-  and rustc/bindgen wrappers are in /root/nfsu2x/mesa-extra) and glslang
-  15.4 built for the Switch in /root/nfsu2x/glslang-switch. switch-sdl2's
+  builddir-switch --destdir $WORK/mesa-sdk` -- the cross/native files
+  and rustc/bindgen wrappers are in $WORK/mesa-extra) and glslang
+  15.4 built for the Switch in $WORK/glslang-switch. switch-sdl2's
   EGL/glapi/drm_nouveau are filtered out of SDL2::SDL2 (a second Mesa);
   SDL's unused EGL calls are stubbed (switch_egl_stubs.c), libelf too.
-- Linux: `-DNFSU2_VULKAN=ON` build in /root/nfsu2x/build-vk-linux; headless on
+- Linux: `-DNFSU2_VULKAN=ON` build in $WORK/build-vk-linux; headless on
   lavapipe: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
   RECOMP_VK_HEADLESS=1` (+ `RECOMP_VK_VALIDATION=1`), frames via
   RECOMP_GL_DUMP. Quick Race renders like GL there.
-- /root/nfsu2x/vktest/ (vktest.nro): minimal NVK clear-screen check.
+- $WORK/vktest/ (vktest.nro): minimal NVK clear-screen check.
 - Caches (like GL's progcache.bin): progcache.bin records are shared with
   GL; vkspirv.bin (glslang output by GLSL hash), vkpipes.bin (pipeline
   variants), vkpipecache.bin (VkPipelineCache, saved at most every 20 s when
@@ -357,6 +365,79 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   XDK form (dp4 rows + rcc + mul + mad) evaluated directly. Only ~5% of the
   drag-line draws (the "half draw nothing" are occluded, not off screen);
   ~0.4 us/draw on x86.
+- **Mipmaps + anisotropy (v27, 2026-10-15, nv2a_vk.c only; changes the Linux and
+  Switch Vulkan output too, GL untouched):** the guest's chains were ignored
+  (one level, maxLod 0), so distant roads and foliage shimmered. Now
+  `tex_get` takes `levels` = SET_TEXTURE_FORMAT [19:16] clamped to
+  log2(max(w,h))+1 and uploads every level of a swizzled texture (each at its
+  own size, contiguous) or DXT texture (4x4 blocks rounded up) in ONE ring
+  allocation + one vkCmdCopyBufferToImage; a cube face carries its own chain
+  (`cube_face_bytes`). The hash covers the whole chain; `VkTex.levels` is part
+  of the cache match. Only DXT1/3/5 and swizzled A8R8G8B8/P8
+  (`swz_chain_ok`, the formats this title uses and the check verified) get a chain; render-target textures, `cube_from_surfaces`, linear
+  and rect textures and unknown formats keep one level. Sampler (uint64 key,
+  512 entries): guest min filter 3/4/5/6 = nearest/linear in-level x
+  nearest/linear between levels (1, 2, 7 = level 0 only, maxLod 0); min/max LOD
+  = TEXTURE_CONTROL0 [29:18]/[17:6] in 4.8 fixed, limited to levels-1; bias =
+  TEXTURE_FILTER [12:0] signed 4.8, clamped to the device limit. Anisotropy
+  only on mipped samplers with a linear min filter. Real values seen: every
+  texture has bias -511/256 (about -2.0; origin unexplained, the A/B with
+  `RECOMP_VK_LOD_BIAS=0` A/B in v27, see below), clamps
+  0..4095, filter 6 (TENT_TENT_LOD), mag 2; chains stop at 8x8 for 256x256
+  (`levels` field 6), so the smallest level is 8x8. The static car cube
+  0x812E7200 is A8R8G8B8 256x256 with ONE level (no chain, unchanged).
+  Env: `RECOMP_VK_MIPS=0` off (as before), `=2` A/B (odd frames sample with
+  maxLod 0 and no aniso; the dump at flip N shows draws of s_frame N-1, so
+  ODD files = mips on, EVEN = off; dumps at N and N+1 with an odd
+  `RECOMP_GL_DUMP` interval, like INSTANCE=2); `RECOMP_VK_ANISO=1|2|4|8|16`
+  (default 4 on iOS, 1 elsewhere: lavapipe 4x costs 5x, 26 -> 4.7 fps at car
+  select, GPUs do not); `RECOMP_VK_LOD_BIAS=<f>` replaces the guest bias;
+  `RECOMP_VK_MIP_LOG=1` names each chain (per-level offsets, last level end vs
+  chain size, closed form for square chains) and each sampler state, `=2` also
+  checks every level against a 2x2 box filter of the previous one.
+  Bias-0 A/B (v27, lavapipe, race start, MIPS=2 pairs, LOD_BIAS=0 ANISO=1;
+  the phone's effective state on A17 Pro, where MoltenVK drops the bias).
+  Render scale 1: glyph-masked edge energy mips on/off: menu text 0.65-0.84,
+  tach numerals 0.79, minimap 0.87, lap box text 1.00; far road 0.63, far
+  buildings 0.69, whole frame 0.81. Text is measurably softer at 1x (the diff
+  sits on the glyphs). Scale 2 (iOS default): menu and HUD text 0.99-1.00
+  (|off-on| about 0, text drawn at >= 1:1 stays on level 0); far road 0.76,
+  whole frame 0.91 (the diff is road/background only). Aniso 4 at scale 0.5
+  never reached the race in two 600 s runs.
+  Shader-side bias: MoltenVK 1.4.2 honours the sampler's mipLodBias only on
+  Apple10 GPUs (VkPhysicalDevicePortabilitySubsetFeaturesKHR.samplerMipLodBias,
+  mirrored locally), so an A17 Pro (Apple 9) ran with bias 0: soft text, smeared
+  far road. When the driver ignores it the bias goes into the fragment shader:
+  every `texture()` in gl_psh.c (Vulkan dialect only) takes `u_lodb.xyzw[stage]`,
+  a vec4 at the end of the fragment std140 block, and all samplers get
+  mipLodBias 0. `bind_stage` writes the value the sampler would have used (same
+  key, same device clamp, 0 for unmipped stages); a uniform, so the pipeline key
+  is unchanged. `RECOMP_VK_SHADER_LOD_BIAS=1|0` forces shader|sampler mode (Linux
+  lavapipe applies the sampler bias, so the two must match); `=2` alternates per
+  frame, dumps at N and N+1 like MIPS=2. Separate runs desync (pad script is
+  wall-clock), so test with `=2` and pause the race with Start: scale 1 pairs are
+  byte-identical outside the animated pause icon, and the main-menu text boxes
+  (title, Quick Race, No Profile, Help) are byte-identical at scales 1 and 2; at scale 2 the only differences are 1 px columns at x = 64k-1 (0.5%,
+  max 76) that also differ between same-mode frames and in the pre-change binary
+  (llvmpipe tile seams), none elsewhere. Control with the shader bias zeroed:
+  27% of pixels differ (max 251), 66-76% inside the menu text boxes. No `textureLod`/`texelFetch` in the guest shaders. Init log `[VK] mipmaps on|off,
+  anisotropy Nx (device max M), lod bias applied by driver|in shader[ (forced)]`; with
+  RECOMP_FPS_LOG a `[vk-mip]` line per 10 s (mipped textures, levels,
+  evictions, MB); budget evictions log (first 8). iOS: "Mipmaps" and "Texture
+  filtering" rows in the panel and the launcher. A/B on lavapipe (race start,
+  one run, pairs from RECOMP_VK_MIPS=2): edge energy of the 3D area -15%, of
+  the far road band -31%, of the near road/HUD band -0.6%; HUD, menu text
+  and the car paint within 0-4% (ratio 0.96-1.0, the rest is the moving
+  background); Layout check (RECOMP_VK_MIP_LOG=2): box-filter error per level 0.0-11
+  (DXT quantisation, P8 0.0-6) for ~400 textures (unique addresses over several runs), DXT1/3, P8 and
+  A8R8G8B8, square and non-square, no jumps. lavapipe fps: car
+  select about 26 both ways, race start 17.9 -> 16.3 (-9%) with ANISO=1 (single
+  runs, another job shared the machine).
+  Validation: only the old VUID-vkCmdSetVertexInputEXT-None-04790 and
+  VkGraphicsPipelineCreateInfo-pDynamicStates-04807 (same with MIPS=0),
+  also with ANISO=4 (that run only reached car select) and RECOMP_GL_DXT=0 (CPU
+  decode of every level; reached the race, checks clean).
+  Mipped textures use 1.33x the memory.
 - **Eden cannot run NVK** (2026-09-29): instance, device, swapchain (only
   IMMEDIATE; FIFO creation hangs) and command recording work, but no GPU
   submission ever completes -- vktest's first fence times out (also with
@@ -430,7 +511,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 ## Performance findings (Switch focus)
 
 - **Start here for performance work: `PERF_NOTES.md`** (state, uncommitted
-  patches in `/root/nfsu2x/perf-wip/`, how to apply, measure, next steps).
+  patches in `$WORK/perf-wip/`, how to apply, measure, next steps).
 
 - Profile on Linux: `/usr/lib/linux-tools-6.8.0-142/perf record -e cpu-clock -F 499 -p $(pgrep -n -x nfsu2_recomp)`
   (the `/usr/bin/perf` wrapper doesn't work on this WSL kernel; `-e cpu-clock` is required).
@@ -438,6 +519,62 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   each. Now they sleep (≤1 ms) when the pushbuffer is idle and are woken by
   `recomp_spin_wake()`, which `RECOMP_SPIN_HINT` calls. A fixed sleep instead
   of the wake slowed the game (every kickoff waited) — don't go back to that.
+- **D3D fence wait sleeps (v31, `RECOMP_FENCE_SLEEP=0` = old spin).** The
+  poll at 0x2E9057 (NFSU1 0x1D0470) used to spin; its yield now sleeps on a
+  condvar (<= 4 ms since v32, `RECOMP_FENCE_SLEEP_US`) while this thread's wrapped BlockOnTime is short of its
+  fence, and `nv2a_pb_exec.c` broadcasts after the 0x1D70 semaphore store
+  (`recomp_fence_*` in kernel_bridge.c; waiters counted, no lock otherwise).
+  Linux/lavapipe: the spin only exists while the game boots (first 14 s,
+  game thread 647 -> 558 ticks, n=20, same progress: kernel calls +3%,
+  frames +2%; first build 609 -> 495, n=30). After that fence waits are
+  <1% of the game thread in the movies (64-90 ms per 10 s, equal with the
+  sleep on or off) and a race's long GPU backlog goes through the
+  kernel-wait path (0.12 cpu-s/s both ways, fps 16-18 both). Intro fps:
+  first build 19.4/19.1 off vs 19.8/19.5 on; final build 17.7/16.3 off vs
+  14.9/15.8 on with the machine loaded by other runs and equal wait times.
+  The 62% spin seen elsewhere needs a GPU faster than lavapipe: measure on
+  the device. `RECOMP_FPS_LOG=1` adds a per-10 s "fence waits N, M ms;
+  sleeps, timed out" line.
+  Idle intro A/B (same boot, no input): game-thread CPU 46-47 s with the
+  sleep off vs 37-38 s on (-18%).
+  Boot hang, not caused by the sleep: 4 of ~230 sleep-on boots hung, and the
+  v29 binary (no fence code) hung 2 of 150 with the same signature
+  (DMA_PUT == DMA_GET, no `[fps]` line). Guest threads 1006 and 1011 cross
+  on CRT/guest locks 0x00428770 and 0x80482DB8 (each holds one, waits for
+  the other; "outstanding 4"). Cause undetermined: a title lock order or a
+  release this runtime dropped (see `crt_lock_trace` in kernel_rtl.c); next
+  step `RECOMP_CS_TRACE_CRT=1` on a hung run.
+- **Fewer wakeups (v32).** At 30 fps the threads wait most of the time, but
+  timers woke the CPU thousands of times a second. Changes, each with a kill
+  switch (old behaviour in brackets):
+  - Guest lock: 16 condition variables by ticket; the unlock wakes only the
+    next ticket. The first wait is 1 ms (it raises `g_gil_contended`), later
+    waits 20 ms (safety net); eager mode keeps 1 ms
+    [`RECOMP_GIL_WAKE_ALL=1`]. The rule for the contended flag is unchanged.
+  - KeTickCount: `xbox_tick_refresh()` stores the clock forward only (CAS).
+    Callers: `gil_lock` after the lock is taken, the executor, and the tick
+    thread, which now sleeps 4 ms [`RECOMP_TICK_MS=1`; 1 ms when
+    `RECOMP_GIL=0`].
+  - Fence sleep timeout 4 ms [`RECOMP_FENCE_SLEEP_US=1000`].
+  - nv2a flag thread wait: the parameter exists, but the default stays 1 ms
+    [`RECOMP_FLAG_WAIT_US=4000` tries 4 ms]. Proof failed: with 4 ms, 70-550
+    timed-out passes per 10 s cleared a bit (all `PCRTC_INTR_0`, which the
+    vblank handler acks itself). Counter line with `RECOMP_FPS_LOG=1`:
+    `[nv2a] flag thread: N passes, M timed out, K of them cleared a bit`.
+  Linux A/B, voluntary switches/s: race 21.7k -> 17.8k (fps equal, 15-17
+  drifts between runs); intro movies 34.8k -> 23.5k, intro fps 15-19 ->
+  24-26 (from the guest-lock change: `RECOMP_GIL_WAKE_ALL=1` gives the old
+  numbers). APU stale ring samples 18-25% -> 4-11% (`RECOMP_APU_RING_STATS=1`).
+  Boot hang rate unchanged (1/26 old, 2/35 new). Device-unverified.
+- **`[cpu]` line and thread names (v32).** `xboxrecomp/src/platform/cpu_report.c`.
+  Every host thread has a name (`game`, `nv2a-exec`, `nv2a-flag`, `tick`,
+  `ktimer`, `ohci`, `apu`, `g:<start VA>` for guest threads, ...). The
+  reporter prints every `RECOMP_CPU_LOG` s (iOS default 10, elsewhere 0):
+  CPU % of the top 8 threads, others, wakeups/s, thermal state, Low Power
+  Mode, battery (iOS: sampled by the overlay, or by `ios_power_timer_start`
+  without it). It starts in `game_main` after the memory layout: from
+  `main()` the contiguous guest window failed to map. On Linux, lavapipe
+  threads fill the top 8: use a per-thread /proc sampler for analysis.
 - `tools/recomp/spin_hint.py` marks the title's poll loops (45 in NFSU2: D3D
   fence 0x2E9057, PGRAPH polls, DirectSound's APU-clock polls on 0xFE820010)
   with `RECOMP_SPIN_HINT()`: pause, wake hardware threads every 16, yield
@@ -471,7 +608,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   (MMX tables at 0x3D0810/1010/1810, called by sub_0025F0B7 per row) stays
   after FFmpeg; native in recomp_manual.c since 2026-10-01 (bit-exact,
   RECOMP_NATIVE=0 / RECOMP_NATIVE_CHECK=1). FFmpeg is a minimal **LGPL** build, vp6 decoder only
-  (`tools/build_ffmpeg_vp6.sh switch|linux` -> /root/nfsu2x/ffmpeg-vp6-*;
+  (`tools/build_ffmpeg_vp6.sh switch|linux` -> $WORK/ffmpeg-vp6-*;
   CMake `-DNFSU2_FFMPEG_DIR`, switch/build.sh `FFMPEG_DIR`). devkitPro's
   switch-ffmpeg is `--enable-gpl` -- don't link it. Log: `[movie] VP6: n
   frames, x ms average`. Linux x86 (plain C): ~1 ms/frame.
@@ -490,6 +627,19 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   middle half is all luma >= 200 as luma 16 (title's buffers only, FFmpeg's
   reference untouched). `NFSU2_MOVIE_FLASH=1` keeps them; off in
   NFSU2_NATIVE_VP6=2. `RECOMP_VK_CUBE=0` turns the car reflections off.
+  **Lifted decoder path (v26, no FFmpeg: iOS and the default Linux build):**
+  sub_002618F0 (recomp_manual.c) tests each decoded picture (+0x254, after
+  the lifted decode) with the same rule and records its Y range in 4 slots;
+  the native converter sub_0025ECB4 fills rows from a white range with the
+  colour of (Y16, U128, V128). The decoder's buffers are not changed (+0x254
+  stays the reference). Linux, FMVOpening with no Start presses (the trailer
+  plays through; the pad script's Start at 15/40 s cuts it short): whites at
+  decoded pictures 1627-2082 of the first play, all after the
+  `MOVIES\FMVOpening.vp6` line; `[movie] rows blacked 5280` in that run.
+  Dump f01651 (flash picture 1627 + 24) is black, f01650 normal. With
+  `NFSU2_MOVIE_FLASH=1` the same dump is white (mean 226.7). The dump offset
+  to the picture index changes per run (+24, +29). `RECOMP_NATIVE=0` (lifted
+  converter) does not black the rows.
 - **Version** (CMakeLists.txt `NFSU2_SWITCH_VERSION`) is a plain variable
   since 0.5: as a CACHE default the 0.4.5 NRO still said 0.4.3.
 - (Before the FFmpeg decoder) movie decoding ran on the game thread: MMX IDCT `sub_0026EB34`, YUV->RGB
@@ -618,7 +768,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   all 8 slots at each call instead was slower (x86 menu 1.18-1.74 vs 0.97
   ms/frame); the index-only version is 0.92 (-5%) on x86, where TLS is
   cheap. Linux race and Eden fine. So far regenerated only into a private
-  gen (scratch gen2 + toolkit copy), not /root/nfsu2x/gen.
+  gen (scratch gen2 + toolkit copy), not $WORK/gen.
 - **Registers in locals (translator `_localize_registers`,
   RECOMP_REG_LOCALS=0 off):** eax..edi and esp shadowed by locals in 19394
   functions (accessors recomp_leaf_ld/st_*, esp added), stored right before
@@ -632,7 +782,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   g_esp and write g_eax. x86 menu: slightly slower (1.06 vs 0.94 ms/frame,
   TLS is cheap there); Eden main menu (ARM code): 38-40 vs 29-32 fps. NRO
   4.6% smaller.
-- **Native culling (src/recomp_manual.c in the scratch repo copy so far):**
+- **Native culling (games/nfsu2/recomp_manual.c in the scratch repo copy so far):**
   sub_0009A330 (box vs 6 frustum planes, returns 0 out / 1 straddle / 2 in)
   and sub_0009A250 (box by matrix, Arvo) in C with the lifted code's exact
   arithmetic (doubles, float rounding where it stores to memory, NaN takes
@@ -645,7 +795,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   0 samples (behind walls / off screen; game culling, not ours:
   RECOMP_NATIVE=0 gives the same counts). Game thread, executor and GL
   thread all ~2x per frame. The track is locked in the test profile: the
-  console save (005213381338) is in /root/nfsu2x/game_drag (symlinks + own
+  console save (`<save id>`) is in $WORK/game_drag (symlinks + own
   UDATA). Path: Main Menu a, right x2 (Drag) a, right x3 a, a x5; without
   throttle the car stays at the line = static, repeatable scene.
   `sub_002213EA` (SSE 4x4 matrix multiply, stdcall out = a * b; twice per
@@ -658,7 +808,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   calls the wrapper directly (`Lifter.wrapped_functions`, test in
   test_manual_call_dispatch.py). The renderer side (per-draw cost) is still
   ~2x there.
-- **More native leaves (2026-10-02, src/recomp_manual.c, Linux race perf
+- **More native leaves (2026-10-02, games/nfsu2/recomp_manual.c, Linux race perf
   of the main thread):** `sub_002A68EC` = MSVC `_ftol2` (589 call sites,
   top self time 4.4%), `sub_000A3CA0` (colour grade LUT, 64x64 x2, rebuilt
   every race frame by sub_000A3FA0 when its params at 0x39D304 change; ~10x
@@ -680,7 +830,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   called every race frame, never lifted): every Linux race logged ~10k
   `[ICALL] Failed to resolve VA 0x000930D0` (each with a trace dump) and
   skipped it; one run then fell to 4 fps. Seeded in
-  config/seed_functions.json (full regen: exactly one function added).
+  games/nfsu2/config/seed_functions.json (full regen: exactly one function added).
 - **LTO (2026-10-02):** CMake `NFSU2_LTO=ON` (+ `NFSU2_LTO_JOBS`) puts the
   lifted code and recomp_manual.c through LTO; `LTO=1 bash switch/build.sh`
   builds in `<build dir>-lto` and stages `nfsu2x[-vulkan]-lto.nro` next to
@@ -703,6 +853,32 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   queued (immediate-when-late flag), so frame times are not quantised --
   an adaptive vblank hold was tried and never triggered (trace: retires
   8 ms after a vblank, no vblank between).
+- **60 fps race time floor (v25, games/nfsu2/recomp_manual.c `dt_floor_at_swap`):**
+  `RECOMP_PRESENT_INTERVAL=1` forces every-vblank presents, so races run
+  above 30 fps. The main-loop time step (sub_001890C0, called per iteration
+  from 0x0018A8C0) clamps time at a floor float[0x428EE8] (1/60 at boot, 1/30
+  at NIS start, 1/60 at NIS stop) and emits N = int(t*3600+0.5) physics
+  ticks. Iterations shorter than the floor count as a full floor, so game
+  time runs at fps/30: 1.10 at 33 fps with floor 1/30 (Linux, lavapipe).
+  Fix: at each swap, under interval 1, set the floor to 0 (zero, the
+  default; measured sim/wall 0.97-0.99, N0=0 in every run). Kill switch:
+  `RECOMP_DT_FLOOR=game` leaves the game's floor (the v24 behaviour).
+  Other modes: `clamp` (floor above 1/60 -> 1/60; 1.13-1.20 near 60 fps),
+  `test30` (debug, forces 1/30). Logs: `[dt] 60 fps time floor: <mode>` once,
+  `[dt] game floor a -> b, using c` on each game change, `RECOMP_DT_LOG=1`
+  per-second line. Interval 2 never reaches this code. Not yet measured at
+  60 fps in a race: lavapipe races ran at 23-26 fps.
+  **v26 (cutscenes):** the NIS plays at 30 fps on its own 1/30 floor, so 60
+  fps there ran it fast and put the cars out of step. Default
+  `RECOMP_DT_FLOOR=auto` now leaves the game's interval and floor while its
+  floor is above 1/60 (cutscene), and forces 60 fps with floor 0 otherwise.
+  Measured (Linux, lavapipe, GL_SCALE=0.5, interval 1): zero (v25) intro
+  cutscene 25 swaps/s, auto 28.3 swaps/s with the swap value 0x80000002 and
+  floor 0.033333; auto finish cutscene 30.1 swaps/s; race after 23.3 swaps/s
+  with swap value 0x80000001 and floor 0. Logs: `[dt] cutscene (game floor
+  ...): 30 fps` and `[dt] cutscene over: 60 fps` once per change; game-floor
+  change lines carry the slot value the game had and the value passed to
+  the swap. `RECOMP_DT_FLOOR=zero` is v25 (60 fps in cutscenes).
 - **Clocks (switch_nx.c, opt-in):** NFSU2_CPU_MHZ / NFSU2_GPU_MHZ /
   NFSU2_MEM_MHZ via clkrst (8.0+) or pcv: highest listed rate <= the
   request, caps 1785 / 921.6 / 1600, old rates restored on exit (atexit +
@@ -766,6 +942,316 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   are slow).
 - Regen from the worktree needs `tools/{disasm,func_id,abi_analysis}/output`
   — symlinked from the main checkout (don't commit the links).
+
+## iOS findings (branch ios-feasibility, v13–v23, 2026-10)
+
+Cross-port notes and device-log checklists are kept outside this repository.
+The analysis against bep1s69/nfsmw-ios (GPLv3) took ideas only, never files.
+
+- **Build:** CI only (a private `ios-app` workflow on macos-14): SDL 2.30.9,
+  glslang 15.1.0 + SPIRV-Tools, MoltenVK 1.4.2 framework, Vulkan-Headers
+  1.3.296, lifted code from a private artifact (never in this repo), unsigned IPA for
+  SideStore/LiveContainer, Info.plist written with PlistBuddy. A fail-fast
+  step runs `xcrun -sdk iphoneos clang -fsyntax-only` on the .m files and
+  main.c before the long steps; ios-deps, MoltenVK, headers and ccache are
+  cached (ccache saved even when the build fails). Linux cannot build the
+  IPA. Local checks: `gcc -fsyntax-only -DNFSU2_IOS=1` on C files, Linux
+  GL/Vulkan builds, the lavapipe harness (playbook).
+- **Threads:** main thread = SDL/UIKit loop (main.c iOS `main`), eager
+  renderer init on it (surface/swapchain need UIKit), game on a 16 MB
+  pthread, Vulkan only from the executor (`vk_flip`, `flush_frame_wait`).
+  QoS (`xbox_qos_apply`, xbox_memory_layout.c) on game + ack threads:
+  `RECOMP_QOS=auto` (v32 default) = USER_INTERACTIVE at
+  `RECOMP_PRESENT_INTERVAL=1`, USER_INITIATED at 30 fps; `1` = always
+  interactive; `0` = off. Panel row "Top thread priority". Before v32 the
+  executor's QoS code never compiled on iOS (it tested `NFSU2_IOS`, which
+  that file does not get); it now tests clang's iOS predefine.
+- **Settings:** `Documents/nfsu2_env.txt` (or `$NFSU2_GAME_DIR`), loaded by
+  `cfg_load` BEFORE `SDL_CreateWindow`, every key exported once with
+  `setenv(k, v, 0)`. `s_cfg` key buffer is 64 bytes
+  (`MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS` is 36 chars; 32 truncated it and
+  the A/B silently did nothing). The gear panel (`ios_touch_overlay.m`)
+  writes through `nfsu2_cfg_set`: updates `s_cfg` + rewrites the file
+  (tmp + rename, unknown lines kept). It must NOT `setenv`: the executor
+  calls `getenv` every flip (`gamma_lut_active`) and setenv can realloc
+  environ under it. Live items apply through setters; others "next launch".
+- **iOS defaults** (main.c, before any thread starts; a file key wins):
+  `RECOMP_GL_SCALE=2`, `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0`,
+  `RECOMP_FRAME_LAG=1`, `RECOMP_QUIET=1` (stderr is unbuffered to
+  `Documents/nfsu2_log.txt`, every line a write).
+- **MoltenVK facts (v1.4.2 source):** reads `MVK_CONFIG_*` once, lazily, via
+  NSProcessInfo; SDL's iOS Vulkan loader already calls
+  `vkEnumerateInstanceExtensionProperties` inside `SDL_CreateWindow`, so env
+  must be set before the window. Default synchronous submits encode inside
+  `vkQueueSubmit` and wait for `nextDrawable` there (our frame cb clears and
+  blits into the swapchain image). Async queue QoS = USER_INITIATED unless
+  `VK_EXT_global_priority` HIGH (-> USER_INTERACTIVE; `NFSU2_VK_QUEUE_HIGH=0`
+  off). `vkQueueWaitIdle` waits for the async jobs (presents included), then
+  commits and waits on a Metal buffer: a drain that must run while
+  foreground. Present modes: FIFO only on Apple GPU family (IMMEDIATE is a
+  runtime Mac1-family check; M-series iPads unverified -- log
+  `[VK] swapchain ... present mode`). `invariant gl_Position` is honoured
+  (`preserveInvariance` from `isPositionInvariant`). No
+  `VK_EXT_vertex_input_dynamic_state` (per-layout pipelines). More than 64
+  device extensions (scan mallocs all). `textureCompressionBC` =
+  `supportsBCTextureCompression`: false on A16 and older iPhones -> DXT goes
+  through the CPU decoder. Push constants crash at draw time (v18), no
+  triangle fans (v33 fan->list), index 65535 is the restart marker (v21),
+  Metal wants 4-byte vertex offsets/strides (`[VK] MISALIGNED` log, v20).
+- **Background (A3, v22):** SDL2 maps WillResignActive -> FOCUS_LOST +
+  MINIMIZED + SDL_APP_WILLENTERBACKGROUND and calls event watchers
+  synchronously inside the UIKit callback, holding its watcher lock. main.c's
+  watch calls `nv2a_vk_background_handshake(300)`; the executor parks before
+  every submit (`ios_park_point`), drains with `vkQueueWaitIdle` only while
+  the deadline holds, then acks; a late request parks with no Vulkan call.
+  Logs `[ios] background handshake: parked in N ms | TIMED OUT`, `[ios]
+  park/unpark`. `NFSU2_BG_HANDSHAKE=0` = flag only.
+- **Swapchain (A1, v22):** a SUBOPTIMAL acquire/present requests a rebuild
+  at the next flip, at most 2 per streak and 500 ms apart; streak resets on
+  an explicit SIZE_CHANGED rebuild or a frame whose acquire AND present
+  both returned SUCCESS (async submits can move the report). Log `[VK]
+  swapchain suboptimal -> rebuild n/2`, `stays suboptimal`.
+  `RECOMP_VK_SC_LIMIT=0` = old behaviour.
+- **Measurement (always on, 10 s):** `[ios-vk]` flips, submit/present
+  avg/max ms, suboptimal/rebuilds, present mode, MVK sync; `[ios-vk2]`
+  passes/frame, upload-split and layout-split passes/frame, uploads and
+  KB/frame, `mem left` (os_proc_available_memory). Thermal state logged on
+  change; FPS label `30.0 fps · 33.3 ms` + WARM/HOT/CRIT (thermal fair/
+  serious/critical) + LPM (Low Power Mode), each logged once per change.
+- **Tile-GPU passes (v23):** a pass that opens with a full clear begins
+  with LOAD_OP_CLEAR instead of LOAD + `vkCmdClearAttachments` (MoltenVK
+  draws a quad for that) -- `RECOMP_VK_CLEAR_LOAD` (iOS default on, else
+  off; 2 = alternate frames for A/B). Texture uploads for textures not yet
+  sampled this frame can go into a pre command buffer submitted before the
+  frame, so they stop splitting passes -- `RECOMP_VK_HOIST` (default off
+  everywhere; panel toggle). Lavapipe: menu/race A/B within animation noise,
+  no new validation VUIDs; up to ~3 folded clears and ~1.2 hoisted uploads
+  per race frame. Still open: no mip levels (`mipLevels = 1`, `maxLod = 0`)
+  and no anisotropy.
+- **Disc image (v23):** `xbox_xiso.c` mounts an XDVDFS image (bases 0x0,
+  0xFD90, 0x30600, 0xFD90000, 0x18300000) when the game dir has no
+  default.xbe but has a `*.iso`, or `NFSU2_ISO=<path>`. D:\ /
+  `\Device\CdRom0` paths are served from it (pread, per-handle positions,
+  read hook kept, writes refused with STATUS_ACCESS_DENIED); saves stay in
+  the game dir's UDATA. Identity check in main.c: title ID 0x4541005A or a
+  clean fatal; SHA-256 mismatch only warns. Linux: boots NFSU2.iso to the
+  same menus as the folder; NFSU1.iso refused; PC CD falls back to folder.
+- **Auto Pad/Drive (experimental, `NFSU2_TOUCH_AUTO`):** `games/nfsu2/state.c`
+  reads gameflow 0x428E34, mode 0x3E5A64, flag 0x3FBCFC from guest memory;
+  the overlay polls in the 0.5 s tick, 2 equal polls switch, a short -1
+  run keeps the layout, 6 in a row (~3 s, e.g. results screen) fall back to
+  Pad (flyby stays Pad), never writes `NFSU2_TOUCH_LAYOUT`. Free roam and quit-to-menu are
+  not validated. Test: `tools/tests/run_state_test.sh`.
+- **NFSU2 controls (Options > Controls, Control Type 1, read from the game
+  on lavapipe):** RT Accelerate, LT Brake/Reverse, left stick Steer, A
+  Handbrake, B Nitrous, X Shift Up, Y Shift Down, Black Look Back, White
+  Change Camera, right stick unused, Start pause; Back/D-pad = free-roam
+  shop/map/stats/SMS. Menu path from boot (pad script): Start 15 s, Start
+  40 s, A 60 s, A 75 s = Main Menu (Quick Race); right x6 Options; right x4
+  Controls.
+- **Touch UI (v24 series):** one CALayer subtree per zone built from the
+  runtime zone table (hit-testing and drawing share it); display link runs
+  only while touched/animating, woken by an activity hook on every finger
+  down (`NFSU2_OVERLAY_WATCH=1` = old 20 Hz timer). DRIVE layout by
+  function (GAS/BRAKE full-press pedals, analog opt-in `NFSU2_ANALOG_PEDALS=1`, fixed steering
+  strip `NFSU2_STEER`/`NFSU2_STEER_SENS`, NOS, E-BRAKE, SHIFT, LOOK, CAM;
+  `NFSU2_DRIVE_CLASSIC=1` = old table). Captions/icons per zone
+  (`NFSU2_TOUCH_CAPTIONS`). Layout editor: per-zone overrides in C
+  (`xbox_ios_touch_zone_set_geom`, text format `v1 <pad|drive> <id> cx cy
+  rx ry`), saved to `Documents/nfsu2_touch_layout_<phone|pad>.txt`.
+  Pre-launch screen `src/ios_launcher.m` runs after cfg_load and before any
+  thread / SDL_CreateWindow, exports only the keys it changed
+  (`nfsu2_cfg_export_changed`); off by default since v29 (see below).
+- **Steering (v25):** DRIVE strip default x 0.06-0.28 (51-239 pt on 852),
+  RELATIVE by default (`NFSU2_STEER_MODE=relative|absolute`): the
+  touch-down x is straight, d = (x - x_down) / (0.075 / sens), clamp, 0.04
+  deadzone rescaled, out = sign(d)*a^curve (`NFSU2_STEER_CURVE` 1.0-2.0,
+  default 1.35); absolute = old centre-based strip. A saved editor
+  override of the strip (zone id 12) keeps the old width until Reset.
+- **Full-press pedals (v28):** DRIVE GAS and BRAKE read 255 for any touch
+  position; the v24 analog slide (255 down to 90 at the bottom) is opt-in with
+  `NFSU2_ANALOG_PEDALS=1` (panel row "Analog pedals", default off). The user
+  found sliding gas and brake inconvenient on glass. A saved
+  `NFSU2_ANALOG_PEDALS=1` in `nfsu2_env.txt` still wins. The launcher has no
+  pedal row. Device-unverified.
+- **No floating sticks in Drive (v28):** in the new DRIVE table a touch on
+  bare screen is not tracked (no finger slot, no activity hook, no stick
+  ring/knob, `xbox_ios_touch_stick` returns 0); the strip is the only steering
+  touch, tilt keeps working. `NFSU2_DRIVE_STICKS=1` (panel "Floating sticks in
+  Drive", default off) restores the v27 sticks. PAD, classic DRIVE and Drive
+  with the strip off (`NFSU2_STEER=0`) keep them, else Drive would have no
+  touch steering. Changing the switch clears all fingers and bumps the layout
+  generation. The launcher has no Drive rows. Device-unverified.
+- **Real d-pad (v28):** the Drive d-pad zone (id 3) is a 79 pt-radius circle
+  at (0.170, 0.370): the cross is ~150 pt across with four separate arm buttons
+  of ~47 pt (`XBOX_IOS_DPAD_ARM_*` in `xinput_ios.h`, mirrored as `DP_*` in the
+  overlay), at least 16 pt above the steering strip (17.3 pt hit-circle gap) and clear of BACK and the island. The
+  overlay draws four arms with gaps, each with its own outline, highlight and a
+  `chevron.*` symbol; PAD uses the same drawing at its old size. Input in the
+  new Drive table is one direction at a time (larger |offset| axis wins, round
+  dead zone 0.30 of the radius); PAD and classic Drive keep the quadrant rule
+  with diagonals. One helper (`dpad_dirs`) feeds both the game state and the
+  highlight. Layout editor keeps working (same zone id). Device-unverified.
+- **No launch screen at start (v29, iOS):** `NFSU2_LAUNCHER` now defaults to
+  off (`nfsu2_launcher_enabled`, main.c); `=1` shows `ios_launcher.m` as before,
+  and it is always shown when `nfsu2_game_data_status()` is 0 (no game folder,
+  no .iso: the only guidance for missing data). Log `nfsu2: launch screen off
+  (NFSU2_LAUNCHER=1 shows it)` / `shown (NFSU2_LAUNCHER=1)` / `shown: no game
+  data`. The launcher leaves nothing behind that SDL uses (SDL 2.30.9 makes its
+  own `UIWindow initWithFrame:`; the launcher's window is hidden and released),
+  so the skip path is the v13-v23 flow; the gear button (re-centred in
+  `adapt_feed` on every layout pass) opens the panel. The panel's old "Show
+  launch screen next time" row became "Launch screen at start" (Display, default
+  off); the launcher row default matches. Every other launcher row already had
+  the same key, values and default in the panel. Device-unverified.
+- **Point-resolution drawable on big iPads (v29, iOS):** main.c drops
+  `SDL_WINDOW_ALLOW_HIGHDPI` when `ios_point_res_wanted()` (ios_launcher.m) says
+  so: `[UIScreen mainScreen].bounds` long side >= 1280 pt AND short side >= 720
+  pt (iPad Pro 13" 1376x1032, Air 13" and Pro 12.9" 1366x1024; Pro 11" 1194 and
+  every iPhone stay native). SDL 2.30.9 then sets the CAMetalLayer
+  `contentsScale` to 1.0 (SDL_uikitmetalview.m), MoltenVK reports
+  `currentExtent = bounds * contentsScale` = points, and the swapchain and the
+  present blit (nv2a_vk.c `create_swapchain`, `s_sc_extent`) are 1376x1032
+  instead of 2752x2064: the clear + blit + present touch a quarter of the pixels. Render
+  scale is unchanged (2x = 1280x960 from the 640x480 guest frame, slightly
+  upscaled by the present blit). Touch
+  is normalised and the overlay is UIKit points, so neither depends on the
+  drawable. `NFSU2_POINT_RES=auto|1|0` (default auto; 1 forces points, 0
+  forces native; panel row "Point resolution (big iPads)" in Display, next launch). Log
+  `nfsu2: drawable at native pixels (852x393 pt, x3)` / `drawable at point
+  resolution (1376x1032 pt, x1; NFSU2_POINT_RES=auto)`; the device check is
+  `[VK] swapchain 1376x1032`. Idea from nfsmw-ios (GPLv3), no code taken.
+  Device-unverified.
+- **Screen buffer at render size (v32, iOS):** The swapchain was the native
+  screen size (iPhone 15 Pro 2556x1179, x3). Each flip cleared all of it and
+  blitted the 1280x960 render into it. Now `main.c` sets a surface hook
+  (`nv2a_vk_set_surface_hook`). `nv2a_vk.c` calls it right after
+  `SDL_Vulkan_CreateSurface` and before `create_swapchain`.
+  `ios_drawable_after_surface` (ios_launcher.m) runs on the main thread only.
+  It finds SDL's CAMetalLayer view (`SDL_GetWindowWMInfo`, then a walk of the
+  window's views). It sets `contentScaleFactor` and `layer.contentsScale` to
+  s = render rows / picture rows in points, then calls `setNeedsLayout` and
+  `layoutIfNeeded`. Render rows = 480 * `RECOMP_GL_SCALE`. Picture height =
+  min(short side, long side / aspect), with aspect 16:9 (4:3 if
+  `RECOMP_WIDESCREEN=0`). s is clamped to 1 .. `nativeScale`. SDL's
+  `layoutSubviews` computes `drawableSize` from `layer.contentsScale`, and
+  MoltenVK `currentExtent` follows. Expected: 2556x1179 -> about 2081x960
+  (2.0 MP instead of 3.0 MP). The compositor scales it to the screen. Touch is
+  in points: unaffected. The point-resolution path (big iPads) is left alone.
+  `NFSU2_COMPACT_DRAWABLE=1|0` (default 1; panel row "Screen buffer at render
+  size" in Display, next launch). Log `nfsu2: drawable at render size: scale
+  2.44 (render 960 rows, ...) -> ~2081x960`; the device check is
+  `[VK] swapchain ~2081x960` (2081 or 2082). If UIKit resets the scale on a rotation, the
+  rebuilt swapchain is native again (the `[VK] swapchain WxH` line shows it).
+  Device-unverified.
+- **Layout geometry order** (`zones_rebuild_locked`): preset -> editor
+  override -> Size -> aspect shape (round zones keep their phone shape in
+  points when the window aspect is >10% off 852/393; `NFSU2_TOUCH_ROUND=0`)
+  -> tablet factor (iPad only, `NFSU2_TOUCH_TABLET_SCALE`, default 0.80) ->
+  safe-area shift: each half of the screen (zone centre < 0.5 / >= 0.5)
+  moves rigidly inward just enough to clear `safeAreaInsets` left/right
+  (spacing and sizes unchanged; ~41 pt per side at 59 pt insets;
+  `NFSU2_TOUCH_SAFE=0` off). Haptics strength `NFSU2_HAPTICS_STRENGTH`
+  light|medium|heavy.
+- **Local UI checks (no Mac):** `tools/tests/run_touch_test.sh` (touch layer
+  behaviour with synthetic SDL finger events), `run_state_test.sh` (race
+  state reader + debounce), `tools/tests/objc_mock/check.sh FILE.m` (ObjC
+  syntax/type check against mock headers; does not prove Apple API names --
+  CI's xcrun fail-fast step does).
+- **Input:** touch layer `xinput_ios.c` (PAD preset unchanged, DRIVE preset
+  with GAS/BRAKE pedals, size 0.7-1.5, layout switch clears fingers),
+  overlay `ios_touch_overlay.m` draws from the same table; touch off really
+  off (`xbox_ios_touch_state` returns nothing). Keyboard: SDL 2.30 owns the
+  GCKeyboard `keyChangedHandler` (sets it + its own queue on every connect),
+  so the game thread reads `SDL_GetKeyboardState` (GCKeyCode == SDL
+  scancode); `ios_keyboard.m` only tracks connect/disconnect. Haptics via a
+  press hook (light impact), tilt via CMMotionManager (off by default,
+  `NFSU2_TILT_FLIP=1` swaps sign), rumble via SDL (`RECOMP_RUMBLE=0`).
+- **Audio:** SDL default category is Playback + MixWithOthers (ignores the
+  mute switch); SDL handles interruptions. `SDL_AUDIO_CATEGORY=playback`
+  stops mixing with other apps.
+- **Guest RAM:** `anon_map_fd` uses an unlinked file in `$TMPDIR`
+  (shm_open is refused in the sandbox). nfsmw-ios uses a Mach memory entry
+  instead; no symptom seen here.
+- **60 fps races on by default (v27, iOS):** main.c sets
+  `RECOMP_PRESENT_INTERVAL=1` with the other iOS defaults (`setenv(..., 0)`:
+  a key in `nfsu2_env.txt` wins, `0` = the old 30 fps races). The gear panel
+  and launch-screen row is "60 fps races" (no "experimental") with
+  `def_on = 1`, so it shows ON when the key is absent. Cutscenes stay at 30
+  fps (v26 `RECOMP_DT_FLOOR=auto`). Device-unverified.
+- **30 fps when hot (v32, iOS):** `xbox_power_hot_cap()` (cpu_report.c) is
+  called once per swap from `swap_pre`; 1 means "run the 60 fps races at 30".
+  `allow = !cutscene && !hot`, so a hot phone gets the game's own interval
+  (unforce) as in a cutscene. Key `NFSU2_HOT_30` (panel row "30 fps when hot",
+  Display section): `off`, `lpm` (Low Power Mode), `serious` (default: thermal
+  serious or critical, or Low Power Mode), `fair`. It engages at once and
+  releases after `RECOMP_HOT_HOLD_S` (default 60) seconds without the
+  condition. Unknown values (-1) count as not hot. Log lines:
+  `[power] 30 fps when hot: serious (NFSU2_HOT_30)`, `[power] hot (thermal
+  serious): 60 fps races -> 30 fps (NFSU2_HOT_30=serious)`, `[power] cool for
+  60 s (...): back to 60 fps`. The cutscene `[dt]` lines stay for cutscenes
+  only. Linux test source: `RECOMP_THERMAL_TEST="2@40,0@70"` (thermal value @
+  seconds since the first `xbox_power_thermal()` call; overlay updates are
+  ignored while it is set). NFSU1 has the same policy. Device-unverified.
+- **Log noise (v27):** iOS default `MVK_CONFIG_LOG_LEVEL=1` (errors only),
+  set before `SDL_CreateWindow` next to the other MVK default; level 2 printed
+  `[mvk-warn] ... Metal does not support disabling primitive restart` for every
+  pipeline (123 lines in one short device session). `recomp_unimpl`
+  (recomp_manual.c) prints each (text, va) site once from a 64-site table;
+  further calls, and calls from sites past the table, are only counted. One
+  line `[UNIMPL] N call(s) from sites beyond the 64-site table were not
+  printed (M repeat call(s) at S printed site(s))` follows every ~10 s (clock
+  checked in the swap wrappers) and at exit, only when sites beyond the table
+  were suppressed since the last line (a hot site repeating prints nothing
+  more). `RECOMP_UNIMPL_TRAP=1` still prints and aborts at the first hit.
+  Linux run: 7 sites, each printed once, no summary. The MVK key is
+  device-unverified.
+- **App icon (v27):** `games/nfsu2/ios/Assets.xcassets/AppIcon.appiconset` (one
+  1024x1024 universal PNG, no alpha: drawn by `tools/make_art.py`: a dark gradient, a neon streak, "U2") and
+  loose PNGs in `games/nfsu2/ios/icon/` (`AppIcon60x60@2x/@3x`, `AppIcon76x76@2x~ipad`,
+  `AppIcon83.5x83.5@2x~ipad`) for LiveContainer and sideload tools. The CI
+  packaging step runs `xcrun actool --compile "$APP" ... --app-icon AppIcon`,
+  merges its partial plist into Info.plist, and always copies the loose PNGs
+  in; if actool fails it writes `CFBundleIcons` / `CFBundleIcons~ipad`
+  (`CFBundleIconFiles` AppIcon60x60, AppIcon76x76, AppIcon83.5x83.5) itself.
+  The log lists `Assets.car` / `AppIcon*` and the icon keys. macOS steps
+  checked by eye and `bash -n` only.
+- **Guest vblank locked to the display (v27, iOS):** the free-running 59.94
+  Hz tick on a 60.00 Hz FIFO screen repeats or slips a frame about every
+  17 s. `xboxrecomp/src/platform/ios_vblank.m` runs a CADisplayLink
+  on its own thread and run loop (60/60/60 range on iOS 15+, else
+  `preferredFramesPerSecond = 60`), started from main.c after the game
+  thread. Each callback reads `kernel_vblank_clock_us()` and
+  `CACurrentMediaTime()` back to back and pushes the vsync time converted to
+  the kernel clock with `kernel_vblank_link_sample()` (Darwin
+  CLOCK_MONOTONIC keeps counting in sleep, mach time does not, so the raw
+  link timestamp is never pushed). kernel_bridge.c keeps a lock-free ring;
+  `kernel_vblank_tick` still runs ONLY on the timer thread (the DISPATCH
+  ordering behind the Quick Race start fix). The timer thread estimates the
+  link period over a ~1 s window, locks only at 59.5-60.5 Hz (a 30 Hz Low
+  Power Mode link or 120 Hz stays free; unlock outside 59.4-60.6), and while
+  locked steps by the link period plus a phase correction e/4 clamped to
+  +-0.5 ms. No sample for 3 periods (background, stall) -> free 59.94 Hz
+  from the current due time, estimator cleared, re-lock after ~0.5 s with the
+  same bounded slew (no tick bursts); an off-period delta restarts the window
+  and keeps the last period, 4 in a row unlock. `NFSU2_VBLANK_LOCK=0` (read in main.c before the game thread
+  starts, and on the timer thread, which then drops the samples) leaves
+  the free-running 59.94 Hz and does not start the link. Logs every 10 s once any sample
+  has arrived: `[vblank] locked|free, link N.NN Hz, guest N.NN Hz,
+  corrections N, fallbacks N, phase err avg N us, adj max N us, step min/max
+  a/b us` (corrections = ticks with |adj| >= 100 us), plus one line per state
+  change (`[vblank] locked: link in range ...`, `free: no link sample for N
+  ms`). No source, no lines, behaviour unchanged. Linux test source:
+  `RECOMP_VBLANK_LINK_TEST=1` pushes a 60.00 Hz clock with +-0.3 ms jitter
+  and stops for 2 s at t = 90 s (`..._GAP_AT`, `..._GAP_S`), resuming 7 ms out
+  of phase; `RECOMP_VBLANK_LINK_TEST_HZ=30@30,60@60` switches its rate
+  (hz@seconds). Linux proof: locks at 60.00, free windows read 59.94, 7 ms
+  phase jump absorbed with step min/max 16.17/17.17 ms; test links of 30 and 120
+  Hz stay free (`free: irregular link timestamps`), 60 Hz again re-locks. Device-unverified:
+  with FIFO a lock whose phase lands on the host's latch could repeat frames
+  more often than the free-run slip; the phase error is in the log line.
+- **Device verification pending:** everything in v22/v23 (no device log on
+  this machine yet).
 
 ## Status (2026-09-28)
 

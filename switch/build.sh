@@ -13,40 +13,45 @@
 # Environment:
 #   DEVKITPRO        default /opt/devkitpro (switch-dev, switch-sdl2, switch-mesa)
 #   XBOXRECOMP_DIR   toolkit (default: the vendored xboxrecomp/)
-#   NFSU2_GEN_DIR    lifted C from tools/regen.sh (default /root/nfsu2x/gen)
-#   NFSU2_GAME_SRC   extracted disc to stage (default /root/nfsu2x/game)
+#   NFSU2_GEN_DIR    lifted C from tools/lift.sh nfsu2 (required)
+#   NFSU2_GAME_SRC   extracted disc to stage (required)
 #   SD_ROOT          staging SD root (default <repo>/switch_sd)
-#   BUILD_DIR        default /root/nfsu2x/build-switch
+#   BUILD_DIR        default <repo>/build-switch
 #   JOBS             parallel compile jobs (default: nproc, capped by memory)
 #   VULKAN=1         the Vulkan renderer: stages nfsu2x-vulkan.nro, built in
-#                    BUILD_DIR (default /root/nfsu2x/build-switch-vk) against
-#                    NVK_SDK (mesa-switch install, default /root/nfsu2x/mesa-sdk/usr/local)
-#                    and GLSLANG_DIR (glslang for the Switch, default /root/nfsu2x/glslang-switch)
+#                    BUILD_DIR (default <repo>/build-switch-vk) against
+#                    NVK_SDK (mesa-switch install, required, e.g. <prefix>/usr/local)
+#                    and GLSLANG_DIR (glslang built for the Switch, required)
 #   LTO=1            link-time optimisation of the lifted code (NFSU2_LTO):
 #                    BUILD_DIR gets a -lto suffix and the NRO is staged as
 #                    nfsu2x[-vulkan]-lto.nro next to the normal one, for A/B.
 #                    LTO_JOBS parallel link jobs (default 4, ~2 GB each)
 #   FFMPEG_DIR       VP6-only LGPL FFmpeg for the movies (tools/build_ffmpeg_vp6.sh
-#                    switch; default /root/nfsu2x/ffmpeg-vp6-switch). Without
+#                    switch; default <repo>/build-ffmpeg-vp6-switch). Without
 #                    it the lifted (slow) decoder plays them.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
 TK="${XBOXRECOMP_DIR:-$REPO/xboxrecomp}"
-GEN="${NFSU2_GEN_DIR:-/root/nfsu2x/gen}"
-GAME="${NFSU2_GAME_SRC:-/root/nfsu2x/game}"
+fail() { echo "error: $*" >&2; exit 1; }
+GEN="${NFSU2_GEN_DIR:-}"
+GAME="${NFSU2_GAME_SRC:-}"
+[ -n "$GEN" ] || fail "set NFSU2_GEN_DIR to the lifted C (tools/lift.sh nfsu2)"
+[ -n "$GAME" ] || fail "set NFSU2_GAME_SRC to the extracted disc folder"
 SD="${SD_ROOT:-$REPO/switch_sd}"
 VK="${VULKAN:-0}"
 if [ "$VK" = "1" ]; then
-    BUILD="${BUILD_DIR:-/root/nfsu2x/build-switch-vk}"
+    BUILD="${BUILD_DIR:-$REPO/build-switch-vk}"
     NRO_NAME=nfsu2x-vulkan.nro
-    NVK_SDK="${NVK_SDK:-/root/nfsu2x/mesa-sdk/usr/local}"
-    GLSLANG_DIR="${GLSLANG_DIR:-/root/nfsu2x/glslang-switch}"
+    NVK_SDK="${NVK_SDK:-}"
+    GLSLANG_DIR="${GLSLANG_DIR:-}"
+    [ -n "$NVK_SDK" ] || fail "VULKAN=1: set NVK_SDK to the mesa-switch install (<prefix>/usr/local)"
+    [ -n "$GLSLANG_DIR" ] || fail "VULKAN=1: set GLSLANG_DIR to glslang built for the Switch"
     VK_ARGS=(-DNFSU2_VULKAN=ON -DNVK_SDK="$NVK_SDK"
              -Dglslang_DIR="$GLSLANG_DIR/lib/cmake/glslang")
 else
-    BUILD="${BUILD_DIR:-/root/nfsu2x/build-switch}"
+    BUILD="${BUILD_DIR:-$REPO/build-switch}"
     NRO_NAME=nfsu2x.nro
     VK_ARGS=(-DNFSU2_VULKAN=OFF)
 fi
@@ -58,7 +63,7 @@ if [ "${LTO:-0}" = "1" ]; then
     LTO_ARGS=(-DNFSU2_LTO=ON -DNFSU2_LTO_JOBS="${LTO_JOBS:-4}")
 fi
 
-FFMPEG_DIR="${FFMPEG_DIR:-/root/nfsu2x/ffmpeg-vp6-switch}"
+FFMPEG_DIR="${FFMPEG_DIR:-$REPO/build-ffmpeg-vp6-switch}"
 if [ -f "$FFMPEG_DIR/lib/libavcodec.a" ]; then
     FF_ARGS=(-DNFSU2_FFMPEG_DIR="$FFMPEG_DIR")
 else
@@ -66,10 +71,9 @@ else
     FF_ARGS=(-DNFSU2_FFMPEG_DIR=)
 fi
 
-fail() { echo "error: $*" >&2; exit 1; }
 [ -f "$DEVKITPRO/cmake/Switch.cmake" ] || fail "devkitPro not found at $DEVKITPRO"
 [ -f "$DEVKITPRO/portlibs/switch/include/SDL2/SDL.h" ] || fail "switch-sdl2 missing"
-[ -f "$GEN/recomp_funcs.h" ] || fail "no generated code in $GEN (run tools/regen.sh)"
+[ -f "$GEN/recomp_funcs.h" ] || fail "no generated code in $GEN (run tools/lift.sh nfsu2)"
 [ -f "$GAME/default.xbe" ] || fail "no extracted disc in $GAME"
 
 if [ -z "${JOBS:-}" ]; then
@@ -81,7 +85,7 @@ fi
 cmake -S "$REPO" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DXBOXRECOMP_DIR="$TK" -DNFSU2_GEN_DIR="$GEN" \
+    -DNFSU_GAME=nfsu2 -DXBOXRECOMP_DIR="$TK" -DNFSU2_GEN_DIR="$GEN" \
     -DNFSU2_SWITCH_ICON="$REPO/assets/icon.jpg" "${VK_ARGS[@]}" "${FF_ARGS[@]}" \
     "${LTO_ARGS[@]}" >/dev/null
 ninja -C "$BUILD" -j"$JOBS"

@@ -1,8 +1,11 @@
 # NFSU2 Switch performance work — handoff (2026-09-29)
 
+`$WORK` is the maintainer's work directory and `<repo>` this checkout.
+The patch files named below are not part of this repository.
+
 Goal: race / open-world fps on the Switch (was 6–12 fps in races, menus fine).
 This file is the state at the end of the session: what was measured, what was
-fixed, what is committed nowhere yet, and what to do next. `CLAUDE.md` has the
+fixed, what is committed nowhere yet, and what to do next. `dev-notes-nfsu2.md` has the
 same findings in short form.
 
 ## Where things stand
@@ -26,22 +29,22 @@ flags) and shader stalls.
 
 ## Patches applied (2026-09-29 20:29 UTC)
 
-Both patches below are now applied to `/root/nfsu2x/xboxrecomp-pr128`, the
-vendored `xboxrecomp/` and `src/`; `/root/nfsu2x/gen` regenerated (LIFT_ONLY)
+Both patches below are now applied to `$WORK/xboxrecomp-pr128`, the
+vendored `xboxrecomp/` and `src/`; `$WORK/gen` regenerated (LIFT_ONLY)
 and the Switch NRO rebuilt (md5 `4779574b…`, ELF kept as
-`/root/nfsu2x/elf_archive/nfsu2x_4779574b.elf` for prof_report). Pre-apply
-backup: `/root/nfsu2x/perf-wip/pre-apply-2029/`. Still uncommitted.
+`$WORK/elf_archive/nfsu2x_4779574b.elf` for prof_report). Pre-apply
+backup: `$WORK/perf-wip/pre-apply-2029/`. Still uncommitted.
 Console run of the 19:42 build (23:13 console time): race 19-21 fps, hitches
 509 -> 325, worst 2184 -> 414 ms, 2 compiles in play (was 54).
 
 ### Original note (before applying)
 
-The later work lives in **patches**, saved in `/root/nfsu2x/perf-wip/`:
+The later work lives in **patches**, saved in `$WORK/perf-wip/`:
 
 | Path | What |
 |---|---|
-| `toolkit.patch` | against `/root/nfsu2x/xboxrecomp-pr128` (and the vendored `xboxrecomp/`): translator passes, recomp_types.h, kernel_bridge.c (GIL priority, clock calls), nv2a_gl.c (hitch log, shader cache, DXT, constants, ring flags), gl_api.h |
-| `repo.patch` | against this repo's `src/recomp_manual.c` (native culling sub_0009A330 / sub_0009A250) |
+| `toolkit.patch` | against `$WORK/xboxrecomp-pr128` (and the vendored `xboxrecomp/`): translator passes, recomp_types.h, kernel_bridge.c (GIL priority, clock calls), nv2a_gl.c (hitch log, shader cache, DXT, constants, ring flags), gl_api.h |
+| `repo.patch` | against this repo's `games/nfsu2/recomp_manual.c` (native culling sub_0009A330 / sub_0009A250) |
 | `xboxrecomp-perf/` | full toolkit copy with everything applied |
 | `repo-src/` | full `src/` copy with everything applied |
 | `bench.sh`, `cat.py`, `findpid.sh` | Linux benchmark and profile helpers (paths inside point at the old scratch dir; adjust) |
@@ -50,13 +53,13 @@ Both patches applied cleanly (dry run) at the end of the session. To bring
 them in:
 
 ```sh
-cd /root/nfsu2x/xboxrecomp-pr128 && patch -p1 < /root/nfsu2x/perf-wip/toolkit.patch
-cd /mnt/c/Users/antox/Documents/nfsu2-xbox/xboxrecomp && patch -p1 < /root/nfsu2x/perf-wip/toolkit.patch   # vendored copy
-cd /mnt/c/Users/antox/Documents/nfsu2-xbox && patch -p1 < /root/nfsu2x/perf-wip/repo.patch
-tools/regen.sh    # LIFT_ONLY=1 is enough; the translator passes and the manual overrides need a regen
+cd $WORK/xboxrecomp-pr128 && patch -p1 < $WORK/perf-wip/toolkit.patch
+cd <repo>/xboxrecomp && patch -p1 < $WORK/perf-wip/toolkit.patch   # vendored copy
+cd <repo> && patch -p1 < $WORK/perf-wip/repo.patch
+tools/lift.sh nfsu2    # LIFT_ONLY=1 is enough; the translator passes and the manual overrides need a regen
 ```
 
-Regen rewrites the shared `/root/nfsu2x/gen/` (another session builds from it;
+Regen rewrites the shared `$WORK/gen/` (another session builds from it;
 `RECOMP_REG_LOCALS=0 RECOMP_X87_LOCALS=0` at regen gives the old output). All
 other changes are already in both toolkit trees and in `src/` (see the list
 below). Nothing is committed.
@@ -73,7 +76,7 @@ below). Nothing is committed.
 - **Direct vertices** (`NV2A_BACKEND_RAW_DIRECT`, `attr_direct`,
   `RECOMP_GL_DIRECT=0` off): the game's vertex bytes uploaded as stored,
   instead of expanding every vertex to 16×float4; only CMP normals converted.
-- **Frame lag** (`RECOMP_FRAME_LAG=1`, src/recomp_manual.c): the main loop
+- **Frame lag** (`RECOMP_FRAME_LAG=1`, games/nfsu2/recomp_manual.c): the main loop
   (`sub_000AEA90`, BlockOnFence return 0x000AEDDB) waited for the frame it had
   just built before Present, so the game and the executor took turns. Waiting
   for the previous frame's fence instead: Eden race 9–18 → 21–24 fps.
@@ -174,9 +177,9 @@ below). Nothing is committed.
   `a` presses.
 
 ## Eden script
-`/root/nfsu2x/run_eden.sh <secs>` (`NRO=name.nro` for another NRO): closes
+`$WORK/run_eden.sh <secs>` (`NRO=name.nro` for another NRO): closes
 Eden politely, force-kills only after 15 s, refuses to start a second Eden,
-restores eden.exe / qt-config.ini from `/root/nfsu2x/eden_backup/` if a hard
+restores eden.exe / qt-config.ini from `$WORK/eden_backup/` if a hard
 kill damaged them (eden.exe had stopped starting after repeated `taskkill /F`).
 
 ## Not done / next steps

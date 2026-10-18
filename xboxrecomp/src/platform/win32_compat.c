@@ -16,6 +16,7 @@
 #define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
+#include "cpu_report.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -1098,10 +1099,11 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-#if defined(__SWITCH__)
+#if defined(__SWITCH__) || defined(NFSU2_IOS)
     /* Recompiled code nests host calls as deep as the guest nests its own,
-     * and Horizon's default thread stack is a fraction of the 8 MB a Linux
-     * thread gets. Match Linux rather than find the overflow in a game. */
+     * and Horizon's/iOS's default thread stack is a fraction of the 8 MB a
+     * Linux thread gets. Match Linux rather than find the overflow in a
+     * game (iOS pthreads default to 512 KB). */
     if (stackSize < 8u * 1024 * 1024)
         stackSize = 8u * 1024 * 1024;
 #endif
@@ -1292,6 +1294,7 @@ static void *timer_thread(void *arg)
     w32_object *o = (w32_object *)arg;
     int once = (o->timer_period == 0);
 
+    xbox_thread_name("w32-timer");
     xbox_nx_spread_thread();
 
     /* initial due time */
@@ -1368,6 +1371,7 @@ struct w32_tp_args { PTP_SIMPLE_CALLBACK cb; PVOID ctx; };
 static void *w32_tp_trampoline(void *arg)
 {
     struct w32_tp_args *a = (struct w32_tp_args *)arg;
+    xbox_thread_name("w32-pool");
     xbox_nx_spread_thread();
     a->cb(NULL, a->ctx);
     free(a);
@@ -2416,7 +2420,23 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
  * memfd_create for this; elsewhere an immediately-unlinked temp file does. */
 static int anon_map_fd(const char *name)
 {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* iOS: shm_open is unreliable in the app sandbox here; back the mapping
+     * with a real file in a writable cache dir instead. Same aliasing
+     * semantics via MAP_SHARED views. */
+    {
+        static volatile LONG map_counter = 0;
+        char path[1024];
+        LONG seq = InterlockedIncrement(&map_counter);
+        const char *dir = getenv("TMPDIR");
+        if (!dir || !dir[0]) dir = "/tmp";
+        snprintf(path, sizeof(path), "%s/%s_%ld",
+                 dir, name ? name : "xbox_map", (long)seq);
+        int fd = open(path, O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd >= 0) unlink(path);   /* mapping outlives the name */
+        return fd;
+    }
+#elif defined(__APPLE__)
     static volatile LONG map_counter = 0;
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);

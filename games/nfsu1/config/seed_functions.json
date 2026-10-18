@@ -1,0 +1,34 @@
+[
+ {
+  "start": "0x000781F0",
+  "note": "ICALL target seen in run; follows ret, chunk-header fixup (0x80034020)"
+ },
+ {
+  "start": "0x001EBC9C",
+  "note": "ICALL target; 55 8B EC 83 EC 0C prologue after zero padding (XPP)"
+ },
+ {
+  "start": "0x001EC4DA",
+  "note": "ICALL target; follows ret 8 (XPP)"
+ },
+ {
+  "start": "0x001F0717",
+  "note": "ICALL target; follows ret 8 (XPP)"
+ },
+ {
+  "start": "0x001EFCB2",
+  "note": "ICALL target; follows ret 8 (XPP)"
+ },
+ {
+  "start": "0x000C3F4D",
+  "note": "EA Trax: message-hash dispatch after sub_000C3F1C's ret, reached by ja from sub_000C3EA0 (was an empty stub: crash opening Options > EA Trax)"
+ },
+ {
+  "start": "0x000C3F92",
+  "note": "EA Trax: call + pop esi; ret 16, reached by je from sub_000C3EA0"
+ },
+ {
+  "start": "0x000C3F9A",
+  "note": "EA Trax: pop esi; ret 16, reached by jne from sub_000C3EA0 (the ret-16 stub skipped the pop)"
+ }
+]

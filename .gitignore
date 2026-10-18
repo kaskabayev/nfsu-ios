@@ -1,65 +1,78 @@
-# Build artifacts
-build/
-out/
-bin/
-*.obj
+# Build directories
+/build/
+/build-*/
+/out/
+/bin/
 *.o
-*.lib
+*.obj
 *.a
+*.lib
 *.exe
 *.dll
 *.pdb
 *.ilk
 *.exp
-
-# CMake
+*.nro
+*.nacp
+*.elf
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
-
-# Visual Studio
 .vs/
+Debug/
+Release/
+x64/
 *.vcxproj
 *.vcxproj.filters
 *.vcxproj.user
 *.sln
-Debug/
-Release/
-x64/
 
-# Generated recompiled code (regenerate from XBE with the recomp pipeline)
-src/recomp/gen/
-
-# Game files (user must provide their own legally-owned copies)
-game/
+# Game data and lifted code: never commit (EA's code and data).
+# The lifted C is made by tools/lift.sh into a folder you choose; the usual
+# names are covered here.
+/src/recomp/gen/
+/gen/
+/gen-*/
+/gen_*/
+/game/
+/game-*/
+/game_*/
 *.xbe
-*.iso
+!/xboxrecomp/tools/conformance/test.xbe
 *.xiso
+*.iso
+*.ipa
+/switch_sd/
 
-# IDE
+# Lift intermediates (disassembly of the XBE, written by the toolkit)
+/xboxrecomp/tools/*/output/
+
+# Logs, captures and caches
+*.log
+xbox_kernel.log
+*_log.txt
+progcache.bin
+vkspirv.bin
+vkpipes.bin
+vkpipecache.bin
+vk*.bin
+prof.bin
+*.wav
+*.raw
+*.bmp
+nfsu1_recomp
+nfsu2_recomp
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors and OS
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 Thumbs.db
 .DS_Store
-
-# Switch SD staging (contains game data)
-switch_sd/
-!xboxrecomp/tools/conformance/test.xbe
-
-# Build outputs and captures
-*.nro
-*.nacp
-*.wav
-*.raw
-__pycache__/
-*.pyc
-gen/
-
-# Per-game toolkit output (disassembly of the retail XBE)
-xboxrecomp/tools/*/output/

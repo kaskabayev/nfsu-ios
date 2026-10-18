@@ -24,6 +24,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
+#include "platform/cpu_report.h"
 
 /* The generated register model (g_eax/g_esp are thread-local there) and the
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
@@ -252,6 +254,44 @@ void sub_0009A250(void)
 }
 void sub_002A9450(void) { crt_memmove(); }
 
+/* ── D3D_SetGammaRamp probe (0x002F0D10) ─────────────────────
+ *
+ * stdcall (ramp), ret 4: the D3D API the title uses to set the display
+ * gamma. Off Windows the target NV2A MMIO bytes are plain guest RAM, so
+ * the write is lost and the display keeps the identity ramp. Capture the
+ * ramp here so the present path can apply it as a LUT (as xemu does), and
+ * log whether it is non-identity once per change. The generated body
+ * (sub_002F0D10_gen) still runs: D3D reads the ramp back through this
+ * memory. */
+uint8_t g_nfsu2_gamma[768];
+uint32_t g_nfsu2_gamma_gen;
+extern void sub_002F0D10_gen(void);
+
+void sub_002F0D10(void)
+{
+    uint32_t ramp = MEM32(esp + 4);
+    const uint8_t *r = (const uint8_t *)XBOX_PTR(ramp);
+    static uint8_t prev[768];
+    memcpy(g_nfsu2_gamma, r, 768);
+    if (memcmp(g_nfsu2_gamma, prev, 768) != 0) {
+        memcpy(prev, g_nfsu2_gamma, 768);
+        /* Release: the LUT bytes are visible before the generation number
+         * (ARM64 readers otherwise pick up a new gen with old bytes). */
+        __atomic_store_n(&g_nfsu2_gamma_gen, g_nfsu2_gamma_gen + 1,
+                         __ATOMIC_RELEASE);
+        int ident = 1;
+        for (int i = 0; i < 256 && ident; i++)
+            if (g_nfsu2_gamma[i] != i || g_nfsu2_gamma[256 + i] != i ||
+                g_nfsu2_gamma[512 + i] != i)
+                ident = 0;
+        fprintf(stderr, "[GAMMA] ramp gen %u: %s, g0=%u g64=%u g128=%u g192=%u g255=%u\n",
+                g_nfsu2_gamma_gen, ident ? "IDENTITY" : "NON-IDENTITY",
+                g_nfsu2_gamma[0], g_nfsu2_gamma[64], g_nfsu2_gamma[128],
+                g_nfsu2_gamma[192], g_nfsu2_gamma[255]);
+    }
+    sub_002F0D10_gen();
+}
+
 /* ── D3D fence wait, D3D_BlockOnTime (0x002E8F20) ────────────
  *
  * stdcall (fence, flags), ret 8. The stock XDK 5849 D3D keeps its device at
@@ -268,6 +308,8 @@ void sub_002A9450(void) { crt_memmove(); }
 #define NFSU2_D3D_DEVICE_PTR 0x002F7798u
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 extern void sub_002E8F20_gen(void);
+extern void recomp_fence_wait_begin(uint32_t sem_va, uint32_t wseq_va, uint32_t fence);
+extern void recomp_fence_wait_end(void);
 
 void sub_002E8F20(void)
 {
@@ -308,13 +350,258 @@ void sub_002E8F20(void)
                 prev = mine;
             }
         }
+        /* The wait's poll loop sleeps on the executor's semaphore writes
+         * instead of spinning (kernel_bridge.c, RECOMP_FENCE_SLEEP=0 spins).
+         * +0x2C is the write sequence the loop's test is relative to. */
+        recomp_fence_wait_begin(sem, dev + 0x2C, MEM32(esp + 4));
         sub_002E8F20_gen();
+        recomp_fence_wait_end();
         return;
     }
     if (sem)
         MEM32(sem) = MEM32(dev + 0x2C);     /* "GPU" is always caught up */
     eax = 0;
     esp += 4 + 8;                           /* return address, 2 stdcall args */
+}
+
+/* ── Swap present-interval forcing (0x002EB4B0 / 0x002EB6A0) ─
+ *
+ * The race 30-fps cap travels as a present interval (0x80000002 = every
+ * second vblank, or plain 2 depending on the EA D3D wrapper that wrote
+ * it) through D3D's global at 0x2F76FC into the two swap paths, one of
+ * which game code calls directly. Forcing it at the device Reset is not
+ * enough: Present saves/overrides/restores the value and the wrappers
+ * rewrite it. Catch it at the readers instead: rewrite every-vblank
+ * whenever RECOMP_PRESENT_INTERVAL=1. The forced present rate also feeds
+ * the main-loop time floor below, so it is not free of side effects. */
+extern void sub_002EB4B0_gen(void);
+extern void sub_002EB6A0_gen(void);
+
+static int swap_interval_wanted(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_PRESENT_INTERVAL");
+        v = (e && strcmp(e, "1") == 0);
+        if (v)
+            fprintf(stderr, "[FPS] RECOMP_PRESENT_INTERVAL=1: swap flips every vblank\n");
+    }
+    return v;
+}
+
+/* The value we replaced at 0x2F76FC, so it can be put back. */
+static int s_forced;
+static uint32_t s_forced_from, s_forced_to;
+
+static void force_interval(uint32_t slot)
+{
+    static uint32_t last;
+    uint32_t cur = MEM32(slot);
+    uint32_t fixed = cur;
+    if (cur == 0x80000002u)
+        fixed = 0x80000001u;
+    else if (cur == 2u)
+        fixed = 1u;
+    if (fixed != cur) {
+        MEM32(slot) = fixed;
+        s_forced = 1;
+        s_forced_from = cur;
+        s_forced_to = fixed;
+        if (cur != last) {
+            last = cur;
+            fprintf(stderr, "[FPS] swap interval 0x%08X -> every vblank\n", cur);
+        }
+    }
+}
+
+/* Undo force_interval where the game still holds what we wrote. A value the
+ * game rewrote itself is left alone. */
+static void unforce_interval(uint32_t slot)
+{
+    if (s_forced && MEM32(slot) == s_forced_to)
+        MEM32(slot) = s_forced_from;
+    s_forced = 0;
+}
+
+/* ── 60 fps time floor (0x428EE8) at each swap ─────────────────
+ *
+ * sub_001890C0, the main-loop time step (one call per iteration from
+ * 0x0018A8C0), takes t = max(acc + dt, float[0x428EE8]), caps t at 3/60 and
+ * emits N = int(t*3600+0.5) physics ticks (0x4289B4). The game sets the
+ * floor to 1/60 at boot, 1/30 at NIS start and 1/60 at NIS stop. Above 30
+ * fps each iteration is shorter than 1/30 and counts as a full 1/30, so
+ * game time runs at fps/30 (measured 1.10 at 33 fps with floor 1/30).
+ * The swap runs after the game's NIS write and before the next iteration,
+ * so the value set here applies to every step.
+ *
+ * Cutscenes (NIS) step at 30 fps on a 1/30 floor, so 60 fps there would run
+ * them fast and put the cars out of step. Auto keeps the game's own cadence
+ * while the floor is above 1/60.
+ *
+ * RECOMP_DT_FLOOR, only with RECOMP_PRESENT_INTERVAL=1:
+ *   auto    (default) floor 0 and 60 fps; the game's own interval and floor
+ *           while its floor is above 1/60 (cutscenes)
+ *   zero    floor 0 and 60 fps always (cutscenes too)
+ *   clamp   floor above 1/60 -> 1/60
+ *   game    leave the game's floor, always 60 fps (the v24 behaviour)
+ *   test30  force 1/30 (reproduces the 2x case)
+ * Unset or unknown is auto. RECOMP_DT_LOG=1 prints a line per second. */
+enum { DT_AUTO, DT_ZERO, DT_CLAMP, DT_GAME, DT_TEST30 };
+static const char *const dt_names[] = { "auto", "zero", "clamp", "game", "test30" };
+
+static int dt_floor_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_DT_FLOOR");
+        v = DT_AUTO;
+        if (e && strcmp(e, "zero") == 0)
+            v = DT_ZERO;
+        else if (e && strcmp(e, "clamp") == 0)
+            v = DT_CLAMP;
+        else if (e && strcmp(e, "game") == 0)
+            v = DT_GAME;
+        else if (e && strcmp(e, "test30") == 0)
+            v = DT_TEST30;
+    }
+    return v;
+}
+
+static float dt_f32(uint32_t raw)
+{
+    float f;
+    memcpy(&f, &raw, sizeof f);
+    return f;
+}
+
+static uint32_t dt_bits(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    return u;
+}
+
+/* The floor to store for the game's floor value. Above 1/60 + epsilon the
+ * game is in a cutscene: auto leaves its floor alone (the caller does not
+ * write it), zero and clamp would replace it. */
+#define DT_60_EPS (1.0f / 60.0f + 1e-5f)
+
+static float dt_use(int mode, float game)
+{
+    switch (mode) {
+    case DT_AUTO:   return game > DT_60_EPS ? game : 0.0f;
+    case DT_ZERO:   return 0.0f;
+    case DT_CLAMP:  return game > 1.0f / 60.0f ? 1.0f / 60.0f : game;
+    case DT_TEST30: return 1.0f / 30.0f;
+    default:        return game;    /* DT_GAME: leave it */
+    }
+}
+
+/* Called from both swap wrappers when RECOMP_PRESENT_INTERVAL=1, before the
+ * generated swap. Sets the floor, forces or unforces the interval, logs. */
+static void swap_pre(uint32_t slot)
+{
+    static int logon = -1, started, seen, last_cut;
+    static uint32_t last_written, last_game;
+    static unsigned swaps, n0;
+    static uint64_t nsum;
+    static double last_s;
+    int mode = dt_floor_mode();
+    uint32_t mem = MEM32(0x428EE8u), slot_game;
+    int changed = 0, allow, cut, hot;
+    uint32_t prev_game = last_game;
+    float game, use;
+
+    /* The game's value: our own write from last frame is not the game's. */
+    slot_game = (s_forced && MEM32(slot) == s_forced_to) ? s_forced_from : MEM32(slot);
+
+    if (!started) {
+        started = 1;
+        fprintf(stderr, "[dt] 60 fps time floor: %s (RECOMP_DT_FLOOR)\n", dt_names[mode]);
+    }
+    if (logon < 0) {
+        const char *e = getenv("RECOMP_DT_LOG");
+        logon = (e && strcmp(e, "1") == 0);
+    }
+
+    /* The game's own floor: whatever was in memory that we did not write. */
+    if (!seen) {
+        seen = 1;
+        last_game = mem;
+        changed = 2;                    /* start */
+    } else if (mode == DT_GAME ? mem != last_game : mem != last_written) {
+        if (mem != last_game) {
+            last_game = mem;
+            changed = 1;
+        }
+    }
+    game = dt_f32(last_game);
+    cut = mode == DT_AUTO && game > DT_60_EPS;      /* cutscene: the game's 30 fps */
+    hot = xbox_power_hot_cap();                     /* heat or Low Power Mode */
+    allow = !cut && !hot;
+
+    if (mode != DT_GAME && (mode != DT_AUTO || allow))
+        MEM32(0x428EE8u) = dt_bits(dt_use(mode, game));
+    if (allow)
+        force_interval(slot);
+    else
+        unforce_interval(slot);
+    last_written = MEM32(0x428EE8u);
+    use = dt_f32(last_written);
+
+    if (changed == 2)
+        fprintf(stderr, "[dt] game floor %.6f (start), using %.6f, slot game 0x%08X swap 0x%08X\n",
+                game, use, slot_game, MEM32(slot));
+    else if (changed == 1)
+        fprintf(stderr, "[dt] game floor %.6f -> %.6f, using %.6f, slot game 0x%08X swap 0x%08X\n",
+                dt_f32(prev_game), game, use, slot_game, MEM32(slot));
+    /* Cutscene lines follow the cutscene only. Heat is logged by the power
+     * module. */
+    if (mode == DT_AUTO && cut != last_cut) {
+        if (cut)
+            fprintf(stderr, "[dt] cutscene (game floor %.6f): 30 fps\n", game);
+        else
+            fprintf(stderr, "[dt] cutscene over: %s\n", hot ? "still 30 fps (hot)" : "60 fps");
+        last_cut = cut;
+    }
+
+    if (logon) {
+        struct timespec ts;
+        double now;
+        swaps++;
+        if (MEM32(0x4289B4u) == 0u)
+            n0++;
+        nsum += (int32_t)MEM32(0x4289B4u);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+        if (last_s == 0.0)
+            last_s = now;
+        if (now - last_s >= 1.0) {
+            fprintf(stderr, "[dt] wall=%.3f swaps=%u N0=%u sim_s=%.4f floor=%.6f slot=0x%08X\n",
+                    now - last_s, swaps, n0, (double)nsum / 3600.0, use, MEM32(slot));
+            swaps = n0 = 0;
+            nsum = 0;
+            last_s = now;
+        }
+    }
+}
+
+static void unimpl_tick(void);
+
+void sub_002EB4B0(void)
+{
+    unimpl_tick();
+    if (swap_interval_wanted())
+        swap_pre(0x2F76FCu);
+    sub_002EB4B0_gen();
+}
+
+void sub_002EB6A0(void)
+{
+    unimpl_tick();
+    if (swap_interval_wanted())
+        swap_pre(0x2F76FCu);
+    sub_002EB6A0_gen();
 }
 
 /* ── D3D interrupt handlers at DISPATCH_LEVEL ────────────────
@@ -475,11 +762,6 @@ void sub_00072F90(void)
  * buffers are swapped as the original does. The border is not filled in:
  * only On2's own motion compensation read it. NFSU2_NATIVE_VP6=0 runs the
  * lifted decoder, =2 runs both and compares the pictures. */
-#ifdef NFSU2_NATIVE_VP6
-#include "movie_vp6.h"
-
-extern void sub_002618F0_gen(void);
-
 typedef struct {
     uint32_t y, u, v, y_stride, uv_stride, w, h;
 } Vp6Planes;
@@ -496,6 +778,85 @@ static Vp6Planes vp6_planes(uint32_t dec, uint32_t buf)
     p.h = MEM32(dec + 0x1B4);
     return p;
 }
+
+/* White pictures from the lifted decoder (no FFmpeg, so no flash rule in
+ * src/movie_vp6.c). FMVOpening cuts between its clips with 1-3 flat white
+ * pictures; the lifted decoder shows them. Each decoded picture is tested
+ * with the rule of movie_vp6.c (luma >= 200 on every sample of the middle
+ * half, step 8) and its Y range recorded. The converter (sub_0025ECB4)
+ * blacks rows that come from a recorded white range. The decoder's buffers
+ * are not touched: +0x254 is the next frame's reference. NFSU2_MOVIE_FLASH=1
+ * keeps the white frames. */
+#define MOVIE_WHITE_SLOTS 4
+typedef struct {
+    uint32_t lo, hi;                    /* Y range [lo, hi) of one buffer */
+    int white;
+} MovieWhite;
+static MovieWhite s_white[MOVIE_WHITE_SLOTS];
+static unsigned s_white_next;
+static unsigned long s_white_found, s_rows_blacked, s_pictures;
+
+static int movie_flash_kept(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("NFSU2_MOVIE_FLASH");
+        v = (e && *e == '1');
+    }
+    return v;
+}
+
+static __attribute__((unused)) int vp6_flat_white(const Vp6Planes *p)
+{
+    uint32_t row, col;
+
+    if (!p->w || !p->h || p->w > 4096 || p->h > 4096)
+        return 0;
+    for (row = p->h / 4; row < p->h * 3 / 4; row += 8)
+        for (col = p->w / 4; col < p->w * 3 / 4; col += 8)
+            if (MEM8(p->y + row * p->y_stride + col) < 200)
+                return 0;
+    return 1;
+}
+
+static __attribute__((unused)) void movie_white_note(uint32_t lo, uint32_t hi, int white)
+{
+    unsigned i;
+    MovieWhite *s = NULL;
+
+    for (i = 0; i < MOVIE_WHITE_SLOTS; i++)
+        if (s_white[i].hi && s_white[i].lo == lo)
+            s = &s_white[i];
+    if (!s) {
+        s = &s_white[s_white_next];
+        s_white_next = (s_white_next + 1) % MOVIE_WHITE_SLOTS;
+    }
+    s->lo = lo;
+    s->hi = hi;
+    s->white = white;
+}
+
+static int movie_row_white(uint32_t y)
+{
+    unsigned i;
+
+    for (i = 0; i < MOVIE_WHITE_SLOTS; i++)
+        if (s_white[i].white && y >= s_white[i].lo && y < s_white[i].hi)
+            return 1;
+    return 0;
+}
+
+static void movie_counters(const char *when)
+{
+    fprintf(stderr, "[movie] white pictures found %lu (%lu pictures, %s)\n",
+            s_white_found, s_pictures, when);
+    fprintf(stderr, "[movie] rows blacked %lu\n", s_rows_blacked);
+}
+
+#ifdef NFSU2_NATIVE_VP6
+#include "movie_vp6.h"
+
+extern void sub_002618F0_gen(void);
 
 /* NFSU2_NATIVE_VP6=2: FFmpeg into a scratch picture, compared with what the
  * lifted decoder left at +0x254. */
@@ -561,9 +922,29 @@ void sub_002618F0(void)
     esp += 4;                           /* cdecl: the caller pops the arguments */
 }
 #else
-/* Built without FFmpeg (NFSU2_FFMPEG_DIR): the lifted decoder. */
+/* Built without FFmpeg (NFSU2_FFMPEG_DIR): the lifted decoder. Each picture
+ * it leaves at +0x254 is checked for the white flash (MOVIE_WHITE_SLOTS). */
 extern void sub_002618F0_gen(void);
-void sub_002618F0(void) { sub_002618F0_gen(); }
+
+void sub_002618F0(void)
+{
+    uint32_t dec = MEM32(esp + 4);
+    static unsigned long frames;
+    Vp6Planes p;
+    int white;
+
+    sub_002618F0_gen();
+    if (eax != 0)
+        return;
+    p = vp6_planes(dec, MEM32(dec + 0x254));
+    white = vp6_flat_white(&p);
+    movie_white_note(p.y, p.y + p.y_stride * p.h, white);
+    s_pictures++;
+    if (white)
+        s_white_found++;
+    if (++frames % 300 == 0)
+        movie_counters("every 300 frames");
+}
 #endif
 
 /* ── 4x4 matrix multiply, sub_002213EA ─────────────────────────
@@ -1483,6 +1864,26 @@ static void yuv_row_native(uint32_t y, uint32_t u, uint32_t v, uint8_t *out, uin
 #endif
 }
 
+/* The colour of (Y16, U128, V128): what a black row converts to. Same
+ * table lookups, wrap and saturation as yuv_row_native. */
+static void yuv_row_black(uint8_t *out, uint32_t n)
+{
+    const int16_t *ty = (const int16_t *)XBOX_PTR(0x003D0810u);
+    const int16_t *tu = (const int16_t *)XBOX_PTR(0x003D1010u);
+    const int16_t *tv = (const int16_t *)XBOX_PTR(0x003D1810u);
+    uint8_t px[8];
+    uint32_t i;
+    int k;
+
+    for (k = 0; k < 4; k++) {
+        int16_t c = (int16_t)(tu[4 * 128 + k] + tv[4 * 128 + k]);
+        px[k] = sat_u8((int16_t)(ty[4 * 16 + k] + c));
+        px[4 + k] = px[k];
+    }
+    for (i = 0; i < n; i++, out += 8)
+        memcpy(out, px, 8);
+}
+
 void sub_0025ECB4(void)
 {
     static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
@@ -1512,7 +1913,12 @@ void sub_0025ECB4(void)
         return;
     }
     nfsu2_movie_row = dst;
-    yuv_row_native(y, u, v, (uint8_t *)XBOX_PTR(dst), n);
+    if (!movie_flash_kept() && movie_row_white(y)) {
+        yuv_row_black((uint8_t *)XBOX_PTR(dst), n);
+        s_rows_blacked++;
+    } else {
+        yuv_row_native(y, u, v, (uint8_t *)XBOX_PTR(dst), n);
+    }
 
     /* What the last step leaves in the registers. */
     last = n - 1u;
@@ -1552,6 +1958,7 @@ void sub_00129610(void)
     for (i = 0; i < sizeof nfsu2_movie_name - 1 && MEM8(buf + i); i++)
         nfsu2_movie_name[i] = (char)MEM8(buf + i);
     nfsu2_movie_name[i] = 0;
+    movie_counters("movie change");
     fprintf(stderr, "[movie] %s\n", nfsu2_movie_name);
 }
 
@@ -1779,19 +2186,98 @@ void recomp_icall_not_code_log(uint32_t va)
  * cause rather than wherever the damage surfaces. */
 #include <stdlib.h>
 
+#define UNIMPL_SITES 64
+
+static struct { const char *text; uint32_t va; } s_ui_site[UNIMPL_SITES];
+static int s_ui_n;                       /* sites in the table */
+static int s_ui_lock;                    /* tiny spin lock: any guest thread */
+static unsigned long long s_ui_repeat;   /* calls past a site's first print */
+static unsigned long long s_ui_over;     /* calls from sites after the table filled */
+static unsigned long long s_ui_reported; /* over-table count at the last summary */
+static int s_ui_atexit;
+
+/* One summary line, only when sites beyond the table were suppressed since
+ * the last one (a hot site repeating is not news: it already printed). Called
+ * every ~10 s from the swap wrappers and at exit. */
+void recomp_unimpl_report(void)
+{
+    unsigned long long rep, over;
+
+    while (__atomic_exchange_n(&s_ui_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    rep = s_ui_repeat;
+    over = s_ui_over;
+    if (over == s_ui_reported) {
+        __atomic_store_n(&s_ui_lock, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    s_ui_reported = over;
+    __atomic_store_n(&s_ui_lock, 0, __ATOMIC_RELEASE);
+    fprintf(stderr, "[UNIMPL] %llu call(s) from sites beyond the %d-site table were "
+                    "not printed (%llu repeat call(s) at the %d printed site(s))\n",
+            over, UNIMPL_SITES, rep, s_ui_n);
+    fflush(stderr);
+}
+
+/* Cheap: look at the clock every 16th swap, report at most every 10 s. */
+static void unimpl_tick(void)
+{
+    static unsigned n;
+    static long long last_ms;
+    struct timespec ts;
+    long long ms;
+
+    if ((++n & 15) != 0)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (!last_ms)
+        last_ms = ms;
+    if (ms - last_ms >= 10000) {
+        last_ms = ms;
+        recomp_unimpl_report();
+    }
+}
+
 void recomp_unimpl(const char *text, uint32_t va)
 {
-    static int printed;
-    const char *trap = getenv("RECOMP_UNIMPL_TRAP");
-    int stop = trap && *trap && *trap != '0';
+    static int trap_cached = -1;
+    int i, fresh = 0;
 
-    if (printed < 50 || stop) {
-        printed++;
+    if (trap_cached < 0) {
+        const char *trap = getenv("RECOMP_UNIMPL_TRAP");
+        trap_cached = (trap && *trap && *trap != '0');
+    }
+
+    /* Each (text, va) site prints once. The table holds UNIMPL_SITES; past
+     * that, calls are only counted. */
+    while (__atomic_exchange_n(&s_ui_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    for (i = 0; i < s_ui_n; i++)
+        if (s_ui_site[i].va == va && s_ui_site[i].text == text)
+            break;
+    if (i < s_ui_n) {
+        s_ui_repeat++;
+    } else if (s_ui_n < UNIMPL_SITES) {
+        s_ui_site[s_ui_n].text = text;
+        s_ui_site[s_ui_n].va = va;
+        s_ui_n++;
+        fresh = 1;
+        if (!s_ui_atexit) {
+            s_ui_atexit = 1;
+            atexit(recomp_unimpl_report);
+        }
+    } else {
+        s_ui_over++;
+    }
+    __atomic_store_n(&s_ui_lock, 0, __ATOMIC_RELEASE);
+
+    if (fresh || trap_cached) {
         fprintf(stderr,
                 "[UNIMPL] untranslated instruction REACHED: `%s` at 0x%08X"
                 " (a no-op; set RECOMP_UNIMPL_TRAP=1 to stop here)\n",
                 text, va);
         fflush(stderr);
     }
-    if (stop) abort();
+    if (trap_cached) abort();
 }

@@ -1,5 +1,7 @@
 /**
- * Need for Speed: Underground 2 (Xbox) - recompiled game entry point
+ * Need for Speed: Underground / Underground 2 (Xbox) - recompiled game entry
+ * point. The game is picked at build time (CMake NFSU_GAME); what differs
+ * between the two sits in games/<game>/game_profile.h.
  *
  * Boot order (same on every host):
  *   crash reporter -> load default.xbe -> xbox_MemoryLayoutInit ->
@@ -18,13 +20,22 @@
 #else
 #  include <signal.h>
 #  include <unistd.h>
+/* POSIX, unconditional: NFSU2_IOS is only defined further down (from
+ * __APPLE__ macros), so an #ifdef NFSU2_IOS here skipped the header on real
+ * iOS builds while command-line -DNFSU2_IOS=1 checks on Linux saw it. */
+#  include <sys/stat.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 
 #include <xbox/xboxrecomp.h>
+#include "platform/cpu_report.h"
+#include "platform/app_id.h"
+#include "game_profile.h"      /* games/<NFSU_GAME>/ */
 
 #ifdef __SWITCH__
 /* libnx lives in switch_nx.c: <switch.h> and the Win32 vocabulary collide. */
@@ -32,6 +43,7 @@ void switch_boot(void);
 void switch_shutdown(void);
 void switch_error_dialog(const char *msg, const char *details);
 #elif !defined(_WIN32)
+
 int SDL_ShowSimpleMessageBox(uint32_t flags, const char *title, const char *message,
                              void *window);
 #endif
@@ -66,15 +78,623 @@ extern void xbe_entry_point(void);
 extern int recomp_dispatch_init(void);
 extern void xbox_path_init(const char *game_dir, const char *save_dir);
 
-#define NFSU2_ENTRY_POINT 0x0021B1CEu
+/* Disc image backend (xboxrecomp/src/kernel/xbox_xiso.c). */
+extern int xiso_autodetect(const char *game_dir);
+extern int xiso_find_image(const char *dir, char *out, size_t n);
+extern void xiso_unmount(void);
+extern void *xiso_read_file(const char *rel, size_t *size);
+extern const char *xiso_image_path(void);
+extern void xiso_sha256(const void *data, size_t len, uint8_t out[32]);
 
+/* The disc this build expects (title ID, version, SHA-256: game_profile.h).
+ * A different title ID is refused; a different SHA-256 (another printing)
+ * only warns, because the lifted code may still match. */
+#define NFSU2_XBE_TITLE_ID NFSU_XBE_TITLE_ID
+#define NFSU2_XBE_VERSION  NFSU_XBE_VERSION
+static const char NFSU2_XBE_SHA256[] = NFSU_XBE_SHA256;
+
+/* Check the default.xbe read from a disc image. Returns 0 to refuse. */
+static int check_disc_identity(const uint8_t *xbe, size_t size)
+{
+    uint8_t sha[32];
+    char hex[65];
+    uint32_t base, cert_va, title_id, version = 0;
+    size_t cert, i;
+
+    if (size < 0x200 || memcmp(xbe, "XBEH", 4) != 0) {
+        fprintf(stderr, "[XISO] FATAL: default.xbe in the image is not an XBE\n");
+        return 0;
+    }
+    memcpy(&base, xbe + 0x104, 4);          /* XBE header: base address   */
+    memcpy(&cert_va, xbe + 0x118, 4);       /* XBE header: certificate VA */
+    cert = (size_t)(cert_va - base);
+    if (cert_va < base || cert + 0xB0 > size) {
+        fprintf(stderr, "[XISO] FATAL: default.xbe in the image has no "
+                "readable certificate\n");
+        return 0;
+    }
+    memcpy(&title_id, xbe + cert + 0x08, 4);
+    memcpy(&version, xbe + cert + 0xAC, 4);
+    if (title_id != NFSU2_XBE_TITLE_ID) {
+        fprintf(stderr, "[XISO] FATAL: wrong game in %s: title ID 0x%08X, "
+                "this build runs only " NFSU_SHORT_NAME " NTSC-U (title ID 0x%08X)\n",
+                xiso_image_path(), title_id, NFSU2_XBE_TITLE_ID);
+        return 0;
+    }
+    xiso_sha256(xbe, size, sha);
+    for (i = 0; i < 32; i++)
+        snprintf(hex + 2 * i, 3, "%02x", sha[i]);
+    if (version != NFSU2_XBE_VERSION || strcmp(hex, NFSU2_XBE_SHA256) != 0)
+        fprintf(stderr, "[XISO] warning: default.xbe differs from the build's "
+                "disc (version 0x%08X, SHA-256 %s); expected version 0x%08X, "
+                "%s. Continuing.\n", version, hex, NFSU2_XBE_VERSION,
+                NFSU2_XBE_SHA256);
+    else
+        fprintf(stderr, "[XISO] default.xbe matches the build (SHA-256 %s)\n", hex);
+    return 1;
+}
+
+#define NFSU2_ENTRY_POINT NFSU_ENTRY_POINT
+
+
+/* iOS detection, once: the iphoneos SDK predefines __IPHONE_OS_VERSION_MIN_REQUIRED__.
+ * (TargetConditionals' TARGET_OS_IPHONE only exists after its header.) */
+/* clang's Darwin driver predefines __ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__
+ * for -target arm64-apple-ios (the plain __IPHONE_OS_VERSION_MIN_REQUIRED__
+ * spelling only exists after TargetConditionals.h). Accept both spellings. */
+#if defined(__APPLE__) && (defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) || \
+                           defined(__IPHONE_OS_VERSION_MIN_REQUIRED__))
+#  define NFSU2_IOS 1
+#endif
+
+/* What the shared runtime asks of the game shell (platform/app_id.h). */
+const char *xbox_app_id(void) { return NFSU_GAME_ID; }
+const char *xbox_app_legacy_id(void) { return NFSU_GAME_ID_LEGACY; }
+
+/* Settings whose default differs from the shared one (game_profile.h). */
+static const struct { const char *key, *val; } s_game_env_defaults[] =
+    NFSU_ENV_DEFAULTS;
+
+/* The settings panels show the game's default for these keys. */
+int xbox_app_default_on(const char *key, int def)
+{
+    for (size_t i = 0; s_game_env_defaults[i].key; i++)
+        if (!strcmp(s_game_env_defaults[i].key, key))
+            return s_game_env_defaults[i].val[0] == '1';
+    return def;
+}
+
+/* Set the game's own defaults. An explicit setting or environment value wins. */
+static void game_env_defaults(void)
+{
+    for (size_t i = 0; s_game_env_defaults[i].key; i++) {
+#ifdef _WIN32
+        if (!getenv(s_game_env_defaults[i].key))
+            _putenv_s(s_game_env_defaults[i].key, s_game_env_defaults[i].val);
+#else
+        setenv(s_game_env_defaults[i].key, s_game_env_defaults[i].val, 0);
+#endif
+    }
+}
+
+#ifdef NFSU2_IOS
+static void ios_crash_handler(int sig)
+{
+    static const char msg[] =
+        "[CRASH] fatal signal caught - last [VKINIT] marker above shows the stage\n";
+    (void)!write(2, msg, sizeof msg - 1);
+    _exit(139);
+}
+
+/* SDL constants (values from SDL_video.h) — main.c avoids including SDL.h */
+#define SDL_INIT_VIDEO          0x00000020u
+#define SDL_WINDOWPOS_CENTERED  0x2FFF0000u
+#define SDL_WINDOW_VULKAN       0x10000000u
+#define SDL_WINDOW_ALLOW_HIGHDPI 0x00002000u
+#define SDL_WINDOW_RESIZABLE    0x00000020u
+int SDL_InitSubSystem(uint32_t flags);
+void *SDL_CreateWindow(const char *title, int x, int y, int w, int h, uint32_t flags);
+const char *SDL_GetError(void);
+int SDL_WaitEvent(void *event);
+void SDL_RaiseWindow(void *window);
+/* Settings: Documents/<id>_env.txt (NFSU_SETTINGS_FILE), KEY=VALUE (Switch nfsu2x_env.txt format). */
+static struct { char key[64]; char val[64]; unsigned char dirty; } s_cfg[64];   /* 64: cfg_load
+ * reads up to 64 lines; a 17th line used to overflow the 16-entry array.
+ * key[64]: MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS is 36 characters and a
+ * 32-byte key exported a truncated name MoltenVK never reads. */
+static int s_cfg_n;
+static const char *cfg_get(const char *k)
+{
+    for (int i = 0; i < s_cfg_n; i++)
+        if (!strcmp(s_cfg[i].key, k))
+            return s_cfg[i].val;
+    return NULL;
+}
+static char *cfg_trim(char *t)
+{
+    while (*t == ' ' || *t == '\t')
+        t++;
+    char *e = t + strlen(t);
+    while (e > t && (e[-1] == ' ' || e[-1] == '\t'))
+        *--e = 0;
+    return t;
+}
+
+static char s_cfg_path[1100];   /* where nfsu2_cfg_set writes back */
+
+/* Copy the file of an older build to the new name, byte for byte (tmp +
+ * rename). cfg_save() rewrites the file at s_cfg_path and copies its other
+ * lines, so the new file must hold the old settings before the first save.
+ * The old file stays. Returns 1 on success. */
+static int cfg_copy_file(const char *from, const char *to)
+{
+    char tmp[sizeof s_cfg_path + 8], buf[4096];
+    FILE *in = fopen(from, "rb"), *out;
+    size_t n;
+    int ok = 1;
+
+    if (!in)
+        return 0;
+    snprintf(tmp, sizeof tmp, "%s.tmp", to);
+    out = fopen(tmp, "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = 0;
+            break;
+        }
+    if (ferror(in))
+        ok = 0;
+    fclose(in);
+    if (fflush(out) != 0 || ferror(out))
+        ok = 0;
+    if (fclose(out) != 0)
+        ok = 0;
+    if (ok && rename(tmp, to) != 0)
+        ok = 0;
+    if (!ok)
+        remove(tmp);
+    return ok;
+}
+
+/* Read the settings. path is the file of this build; saves go there. When it
+ * does not exist and legacy is not NULL, the file of an older build is read
+ * instead and copied to path (the phone keeps its settings after a rename). */
+static void cfg_load(const char *path, const char *legacy)
+{
+    FILE *f;
+    char line[128];
+    const char *from = path;
+    /* Recorded before fopen: a missing file is created by the first save. */
+    snprintf(s_cfg_path, sizeof s_cfg_path, "%s", path);
+    f = fopen(path, "r");
+    if (!f) {
+        xbox_app_log("no settings file at %s (%s)\n",
+                path, strerror(errno));
+        if (legacy)
+            f = fopen(legacy, "r");
+        if (!f)
+            return;
+        from = legacy;
+        xbox_app_log("settings: using the old file %s (saves go to %s)\n",
+                legacy, path);
+        if (!cfg_copy_file(legacy, path))
+            xbox_app_log("settings: cannot copy the old file to %s (%s)\n",
+                    path, strerror(errno));
+    }
+    while (s_cfg_n < 64 && fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '=');
+        if (!eq || eq == line)
+            continue;
+        *eq = 0;
+        char *nl = eq + 1 + strcspn(eq + 1, "\r\n");
+        *nl = 0;
+        /* UTF-8 BOM on the first line (Files app edits) shifts the key. */
+        if (s_cfg_n == 0 && (unsigned char)line[0] == 0xEF &&
+            (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
+            memmove(line, line + 3, strlen(line + 2));
+        char *k = cfg_trim(line), *v = cfg_trim(eq + 1);
+        snprintf(s_cfg[s_cfg_n].key, sizeof s_cfg[0].key, "%s", k);
+        snprintf(s_cfg[s_cfg_n].val, sizeof s_cfg[0].val, "%s", v);
+        /* Same contract as the Switch's nfsu2x_env.txt: every line is also
+         * exported to the environment so renderer/game switches
+         * (RECOMP_PRESENT_INTERVAL, RECOMP_GL_SCALE, ...) read it. */
+        setenv(s_cfg[s_cfg_n].key, s_cfg[s_cfg_n].val, 0);
+        s_cfg_n++;
+    }
+    fclose(f);
+    xbox_app_log("settings loaded (%d keys) from %s\n", s_cfg_n, from);
+    for (int i = 0; i < s_cfg_n; i++)
+        xbox_app_log("  %s=%s\n", s_cfg[i].key, s_cfg[i].val);
+}
+const char *nfsu2_cfg_path(void)
+{
+    return s_cfg_path[0] ? s_cfg_path : NULL;
+}
+
+/* The file's value (as changed by nfsu2_cfg_set), else the environment (a
+ * key set outside the file), else NULL. The pointer may be into s_cfg: copy it before calling nfsu2_cfg_set. */
+const char *nfsu2_cfg_get(const char *key)
+{
+    const char *v = cfg_get(key);
+    return v ? v : getenv(key);
+}
+
+/* Does the line [p, eol) hold `key` (trimmed, as cfg_load reads it)? */
+static int cfg_line_has_key(const char *p, const char *eol, const char *key,
+                            size_t klen)
+{
+    const char *eq = (const char *)memchr(p, '=', (size_t)(eol - p));
+    const char *e;
+    if (!eq || eq == p)
+        return 0;
+    while (p < eq && (*p == ' ' || *p == '\t'))
+        p++;
+    e = eq;
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t'))
+        e--;
+    return (size_t)(e - p) == klen && memcmp(p, key, klen) == 0;
+}
+
+/* Rewrite the settings file with key=val. Every other line is copied byte
+ * for byte (comments, unknown keys, line endings). The new file goes to
+ * <path>.tmp first and rename() swaps it in, so a kill mid-write cannot
+ * leave a half file. Returns 1 on success. */
+static int cfg_save(const char *key, const char *val)
+{
+    char *buf = NULL;
+    size_t len = 0, cap = 0, pos = 0, klen = strlen(key);
+    char tmp[sizeof s_cfg_path + 8];
+    int done = 0, ok = 1;
+    FILE *f = fopen(s_cfg_path, "rb");
+
+    if (f) {
+        for (;;) {
+            size_t n;
+            if (len + 1 >= cap) {
+                size_t nc = cap ? cap * 2 : 1024;
+                char *nb = (char *)realloc(buf, nc);
+                if (!nb) {
+                    free(buf);
+                    fclose(f);
+                    return 0;
+                }
+                buf = nb;
+                cap = nc;
+            }
+            n = fread(buf + len, 1, cap - len - 1, f);
+            if (n == 0)
+                break;
+            len += n;
+            if (len > (1u << 20)) {   /* not a settings file */
+                free(buf);
+                fclose(f);
+                return 0;
+            }
+        }
+        fclose(f);
+    }
+
+    snprintf(tmp, sizeof tmp, "%s.tmp", s_cfg_path);
+    f = fopen(tmp, "wb");
+    if (!f) {
+        xbox_app_log("cannot write %s (%s)\n", tmp, strerror(errno));
+        free(buf);
+        return 0;
+    }
+    while (pos < len) {
+        size_t e = pos, next, eol, bom = 0;
+        while (e < len && buf[e] != '\n')
+            e++;
+        next = e < len ? e + 1 : e;
+        eol = e;
+        if (eol > pos && buf[eol - 1] == '\r')
+            eol--;
+        /* UTF-8 BOM on the first line: skip it for the match, keep it. */
+        if (pos == 0 && eol >= 3 && (unsigned char)buf[0] == 0xEF &&
+            (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF)
+            bom = 3;
+        if (!done && cfg_line_has_key(buf + pos + bom, buf + eol, key, klen)) {
+            if (bom)
+                fwrite(buf, 1, bom, f);
+            fprintf(f, "%s=%s", key, val);
+            fwrite(buf + eol, 1, next - eol, f);   /* original line ending */
+            done = 1;
+        } else {
+            fwrite(buf + pos, 1, next - pos, f);
+        }
+        pos = next;
+    }
+    if (!done) {
+        if (len && buf[len - 1] != '\n')
+            fputc('\n', f);
+        fprintf(f, "%s=%s\n", key, val);
+    }
+    free(buf);
+    if (fflush(f) != 0 || ferror(f))
+        ok = 0;
+    else
+        fsync(fileno(f));
+    if (fclose(f) != 0)
+        ok = 0;
+    if (ok && rename(tmp, s_cfg_path) != 0) {
+        xbox_app_log("rename %s failed (%s)\n", tmp, strerror(errno));
+        ok = 0;
+    }
+    if (!ok)
+        remove(tmp);
+    return ok;
+}
+
+/* Main thread only (the panel). Updates the live table, then the file.
+ * Returns 1 when the file was written too. No setenv here: the renderer
+ * calls getenv() on its own thread every flip, and setenv can reallocate
+ * environ under it. Boot-time keys are exported once by cfg_load; the panel
+ * reads values back through nfsu2_cfg_get (s_cfg first); live items take
+ * effect through their own setters. */
+int nfsu2_cfg_set(const char *key, const char *val)
+{
+    int idx = -1, i;
+
+    if (!key || !val || !key[0] ||
+        strlen(key) >= sizeof s_cfg[0].key || strlen(val) >= sizeof s_cfg[0].val ||
+        strpbrk(key, "=\r\n \t") || strpbrk(val, "=\r\n")) {
+        xbox_app_log("setting rejected (bad key or value)\n");
+        return 0;
+    }
+    for (i = 0; i < s_cfg_n; i++)
+        if (!strcmp(s_cfg[i].key, key)) {
+            idx = i;
+            break;
+        }
+    if (idx < 0) {
+        if (s_cfg_n >= (int)(sizeof s_cfg / sizeof s_cfg[0])) {
+            xbox_app_log("setting %s dropped (table full)\n", key);
+            return 0;
+        }
+        idx = s_cfg_n++;
+        snprintf(s_cfg[idx].key, sizeof s_cfg[0].key, "%s", key);
+    }
+    snprintf(s_cfg[idx].val, sizeof s_cfg[0].val, "%s", val);
+    /* Changed since boot: nfsu2_cfg_export_changed() exports it, even when
+     * the file write below fails (the value still applies to this boot). */
+    s_cfg[idx].dirty = 1;
+
+    if (!s_cfg_path[0]) {
+        xbox_app_log("setting %s=%s not saved (no settings path)\n", key, val);
+        return 0;
+    }
+    if (!cfg_save(key, val)) {
+        xbox_app_log("setting %s=%s not saved (write failed)\n", key, val);
+        return 0;
+    }
+    xbox_app_log("setting %s=%s saved\n", key, val);
+    return 1;
+}
+
+/* Export the keys nfsu2_cfg_set changed since boot (or since the last call)
+ * with overwrite, then clear their flags. Same contract as cfg_load's bridge
+ * (empty values too: SDL_AUDIO_CATEGORY "on" is ""), but overwriting, so a
+ * launch-screen choice beats the value cfg_load exported. setenv may
+ * reallocate environ: main() calls this on the main thread before the first
+ * thread exists, and nowhere else. */
+void nfsu2_cfg_export_changed(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < s_cfg_n; i++) {
+        if (!s_cfg[i].dirty)
+            continue;
+        s_cfg[i].dirty = 0;
+        if (setenv(s_cfg[i].key, s_cfg[i].val, 1) == 0)
+            n++;
+    }
+    if (n)
+        xbox_app_log("%d launch-screen setting(s) exported\n", n);
+}
+
+float nfsu2_cfg_overlay_alpha(void)
+{
+    const char *v = cfg_get("NFSU2_OVERLAY_ALPHA");
+    float a = v ? (float)atof(v) : 0.55f;
+    return a < 0.2f ? 0.2f : a > 0.8f ? 0.8f : a;
+}
+int nfsu2_cfg_show_fps(void)
+{
+    const char *v = cfg_get("NFSU2_SHOW_FPS");
+    return v ? (*v == '1' || *v == 'y') : 1;
+}
+void SDL_SetHint(const char *name, const char *value);
+int SDL_PollEvent(void *event);
+/* SDL_syswm.h subset: SDL_GetWindowWMInfo(SDL_Window*, SDL_SysWMinfo*).
+ * Layout per SDL 2.30.x: version = three single BYTES, then an int
+ * subsystem at offset 4, then the union at offset 8. The UIKit variant
+ * writes the UIWindow at info.uikit.window (and framebuffer fields after
+ * it from 2.0.4 - hence the 64-byte dummy to make room). */
+struct sdl_syswm_uikit { void *window; uint32_t framebuffer, colorbuffer,
+                          resolveframebuffer; };
+struct sdl_syswm_info {
+    uint8_t version_major, version_minor, version_patch;
+    int subsystem;
+    union {
+        struct sdl_syswm_uikit uikit;
+        uint8_t dummy[64];
+    } info;
+};
+int SDL_GetWindowWMInfo(void *window, struct sdl_syswm_info *info);
+/* SDL_EventFilter is int (*)(void *userdata, SDL_Event *event); the event
+ * pointer is opaque here and its type is the first Uint32. */
+void SDL_AddEventWatch(int (*filter)(void *userdata, void *event), void *userdata);
+/* SDL_hints.h / SDL_video.h / SDL_syswm.h values */
+#define SDL_HINT_ORIENTATIONS "SDL_IOS_ORIENTATIONS"
+#define SDL_WINDOWEVENT 0x200
+#define SDL_QUIT 0x100
+#define SDL_SYSWM_UIKIT 5   /* SDL_syswm.h: UNKNOWN0 WINDOWS1 X11-2 DIRECTFB3 COCOA4 UIKIT5 */
+#define SDL_APP_WILLENTERBACKGROUND 0x103
+#define SDL_APP_DIDENTERBACKGROUND 0x104
+#define SDL_APP_DIDENTERFOREGROUND 0x106
+/* SDL_WindowEvent: type, timestamp, windowID, event, padding, data1, data2 */
+struct sdl_winev { uint32_t type, ts; uint32_t win; uint8_t ev; int pad; int d1, d2; };
+#endif
 
 #if defined(__SWITCH__)
 #  define NFSU2_DEFAULT_GAME_DIR "sdmc:/switch/nfsu2x/game"
 #  define NFSU2_DEFAULT_SAVE_DIR "sdmc:/switch/nfsu2x/save"
+#elif defined(NFSU2_IOS)
+/* iOS sandbox: the app bundle is read-only; the game data goes in the app's
+ * Documents folder (Files app → On My iPhone → NFSU2, or pushed by
+ * SideStore/Filza). NFSU2_GAME_DIR still wins if set. */
+#  define NFSU2_DEFAULT_GAME_DIR NSTemporaryDirectory_path("Documents")
+#  define NFSU2_DEFAULT_SAVE_DIR NSTemporaryDirectory_path("Documents/Saves")
 #else
 #  define NFSU2_DEFAULT_GAME_DIR "game"
 #  define NFSU2_DEFAULT_SAVE_DIR NULL
+#endif
+
+#if defined(NFSU2_IOS)
+/* Forward declaration: the default-dir macros expand to this call. */
+static const char *NSTemporaryDirectory_path(const char *sub);
+/* stderr has no console on iOS: mirror it to Documents/<id>_log.txt so the
+ * first boots are diagnosable from the Files app. */
+static void ios_log_to_documents(void)
+{
+    static char log_path[1100];
+    static int done;
+    if (done)
+        return;
+    done = 1;
+    snprintf(log_path, sizeof log_path, "%s/%s",
+             NSTemporaryDirectory_path("Documents"), NFSU_LOG_FILE);
+    if (!freopen(log_path, "w", stderr))
+        return;
+    setvbuf(stderr, NULL, _IOLBF, 0);
+}
+/* Documents = the app sandbox's Documents folder. Computed once, kept
+ * for the process lifetime (xbox_path_init copies the string). */
+static char nfsu2_ios_dir[1024];
+static char nfsu2_ios_save[1024];
+static char nfsu2_ios_gamedir[1024];
+static const char *NSTemporaryDirectory_path(const char *sub)
+{
+    /* CFFIXED_USER_HOME is the sandbox home iOS sets for every app; Documents
+     * sits directly in it. TMPDIR is <sandbox>/tmp, so from there Documents is
+     * one level up. */
+    const char *home = getenv("CFFIXED_USER_HOME");
+    if (home && home[0])
+        snprintf(nfsu2_ios_dir, sizeof nfsu2_ios_dir, "%s/Documents", home);
+    else {
+        const char *tmp = getenv("TMPDIR");
+        if (!tmp || !tmp[0])
+            tmp = "/tmp";
+        size_t n = strlen(tmp);
+        while (n > 1 && tmp[n - 1] == '/')
+            n--;
+        snprintf(nfsu2_ios_dir, sizeof nfsu2_ios_dir, "%.*s/Documents",
+                 (int)(strcmp(tmp + n - 4, "/tmp") == 0 ? n - 4 : n), tmp);
+    }
+    snprintf(nfsu2_ios_save, sizeof nfsu2_ios_save, "%s/Saves", nfsu2_ios_dir);
+    (void)sub;
+    return nfsu2_ios_dir;
+}
+static const char *ios_save_dir(void)
+{
+    if (!nfsu2_ios_save[0])
+        NSTemporaryDirectory_path("Documents");
+    return nfsu2_ios_save;
+}
+
+/* Folders people copy the game into, probed in this order after the plain
+ * game dir. Shared with game_main so the launch screen and the boot agree. */
+static const char *const nfsu2_ios_alts[] = NFSU_IOS_DATA_FOLDERS;
+
+/* Names for the launch screen (game_profile.h). */
+const char *nfsu2_game_long_name(void) { return NFSU_LONG_NAME; }
+const char *nfsu2_game_short_name(void) { return NFSU_SHORT_NAME; }
+const char *nfsu2_game_iso_name(void) { return NFSU_ISO_NAME; }
+
+/* Build label for the launch screen. */
+const char *nfsu2_build_label(void)
+{
+    return NFSU_BUILD_TAG " " __DATE__;
+}
+
+/* Is the launch screen asked for? NFSU2_LAUNCHER, default OFF (v29): the game
+ * starts at once and the gear button opens the settings. 1/y/t on, anything
+ * else (0/n/f, an odd value, unset) off. Missing game data shows it anyway:
+ * see the call site in main(). */
+static int nfsu2_launcher_enabled(void)
+{
+    const char *v = nfsu2_cfg_get("NFSU2_LAUNCHER");
+
+    return v && (*v == '1' || *v == 'y' || *v == 'Y' || *v == 't' || *v == 'T');
+}
+
+/* What game_main will find, decided WITHOUT mounting or reading anything, so
+ * the launch screen can run on the main thread before the window exists.
+ * Mirrors game_main's resolution in the same order (game_dir at lines
+ * 1155-1185, xiso_autodetect(game_dir) at line 1196; keep them in step):
+ *   1. NFSU2_GAME_DIR, else Documents                    (game_main: game_dir)
+ *   2. <dir>/default.xbe; if absent, the first of nfsu2_ios_alts whose
+ *      default.xbe exists becomes the dir; if none does the dir stays as is
+ *   3. xiso_find_image(dir): NFSU2_ISO=0 off, NFSU2_ISO=<path> (beats a
+ *      folder, as xiso_autodetect always did), no default.xbe -> the first
+ *      *.iso in sorted order. Found and a regular file -> image.
+ *   4. else default.xbe present -> folder
+ *   5. else none
+ * Returns 1 folder, 2 image, 0 none; desc gets "folder: <path>",
+ * "image: <name> (<size>)" or "none". An image that exists but fails to
+ * mount at boot cannot be seen from here (nothing is opened). Local buffers
+ * only: nfsu2_ios_gamedir stays for game_main. */
+int nfsu2_game_data_status(char *desc, size_t n)
+{
+    char dir[1100], probe[1200], img[1100];
+    const char *gd = getenv("NFSU2_GAME_DIR");
+    int found = 0;
+    size_t i;
+    FILE *f;
+    struct stat st;
+
+    if (!desc || n == 0)
+        return 0;
+    desc[0] = 0;
+    if (!gd || !gd[0])
+        gd = NFSU2_DEFAULT_GAME_DIR;
+    snprintf(dir, sizeof dir, "%s", gd);
+
+    snprintf(probe, sizeof probe, "%s/default.xbe", dir);
+    f = fopen(probe, "rb");
+    if (f) { fclose(f); found = 1; }
+    for (i = 0; !found && i < sizeof nfsu2_ios_alts / sizeof nfsu2_ios_alts[0]; i++) {
+        char alt[1100];
+
+        snprintf(alt, sizeof alt, "%s/%s", dir, nfsu2_ios_alts[i]);
+        snprintf(probe, sizeof probe, "%s/default.xbe", alt);
+        f = fopen(probe, "rb");
+        if (f) {
+            fclose(f);
+            snprintf(dir, sizeof dir, "%s", alt);
+            found = 1;
+        }
+    }
+
+    if (xiso_find_image(dir, img, sizeof img) &&
+        stat(img, &st) == 0 && S_ISREG(st.st_mode)) {
+        const char *base = strrchr(img, '/');
+        double gb = (double)st.st_size / 1e9;
+
+        snprintf(desc, n, "image: %s (%.2f GB)", base ? base + 1 : img, gb);
+        return 2;
+    }
+    if (found) {
+        snprintf(desc, n, "folder: %s", dir);
+        return 1;
+    }
+    snprintf(desc, n, "none");
+    return 0;
+}
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -158,6 +778,10 @@ static void install_crash_reporter(void)
 static void install_crash_reporter(void) {}
 #else
 #include <execinfo.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 static void crash_signal(int sig, siginfo_t *si, void *uc)
 {
@@ -179,6 +803,23 @@ static void crash_signal(int sig, siginfo_t *si, void *uc)
     raise(sig);
 }
 
+#ifdef __linux__
+/* SIGUSR1 to one thread (tgkill): print that thread's guest state and host
+ * backtrace, then go on. For hangs: a stack snapshot of every guest thread. */
+static void snapshot_signal(int sig, siginfo_t *si, void *uc)
+{
+    void *frames[32];
+    int n;
+    (void)sig; (void)si; (void)uc;
+    fprintf(stderr, "[SNAP] thread %ld\n", (long)syscall(SYS_gettid));
+    print_guest_state();
+    n = backtrace(frames, 32);
+    fprintf(stderr, "  host backtrace:\n");
+    fflush(stderr);
+    backtrace_symbols_fd(frames, n, 2);
+}
+#endif
+
 static void install_crash_reporter(void)
 {
     struct sigaction sa;
@@ -197,6 +838,10 @@ static void install_crash_reporter(void)
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGFPE, &sa, NULL);
+#ifdef __linux__
+    sa.sa_sigaction = snapshot_signal;
+    sigaction(SIGUSR1, &sa, NULL);
+#endif
 }
 #endif
 
@@ -232,11 +877,11 @@ static void fatal(const char *msg)
 {
     fprintf(stderr, "[FATAL] %s\n", msg);
 #if defined(_WIN32)
-    MessageBoxA(NULL, msg, "NFSU2 recomp", MB_ICONERROR);
+    MessageBoxA(NULL, msg, NFSU_SHORT_NAME " recomp", MB_ICONERROR);
 #elif defined(__SWITCH__)
     switch_error_dialog(msg, NULL);
 #else
-    SDL_ShowSimpleMessageBox(0x10, "NFSU2 recomp", msg, NULL);
+    SDL_ShowSimpleMessageBox(0x10, NFSU_SHORT_NAME " recomp", msg, NULL);
 #endif
 }
 
@@ -257,6 +902,7 @@ void xbox_nx_track_thread(void *entry);   /* win32_compat.c: Switch [perf] repor
 
 static void *game_thread(void *arg)
 {
+    xbox_thread_name("game");
     xbox_nx_spread_thread();
     xbox_nx_track_thread(NULL);          /* "game:" in the [perf] report */
     *(int *)arg = game_main();
@@ -281,12 +927,353 @@ int main(int argc, char **argv)
     switch_shutdown();
     return rc;
 }
-#else
+#elif defined(NFSU2_IOS)
+#include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#define NFSU2_HAS_QOS 1
+#endif
+/* iOS: SDL renames main to SDL_main and calls it on the UIKit main thread.
+ * game_main blocks there forever, so the run loop never turns: no screen
+ * commit, no touch delivery, watchdog kills backgrounding. Mirror the
+ * Switch layout instead: the game runs on a big pthread and the main thread
+ * services SDL events. */
+static void *ios_game_thread(void *arg)
+{
+    xbox_thread_name("game");
+#if defined(NFSU2_HAS_QOS)
+    /* xbox_memory_layout.c: RECOMP_QOS = auto | 1 | 0; the executor asks the
+     * same function, so both threads get the same class. */
+    extern void xbox_qos_apply(const char *who);
+    xbox_qos_apply("game thread");
+#endif
+    *(int *)arg = game_main();
+    return NULL;
+}
+
+/* Detached: reports the renderer state for 60s without blocking the main
+ * run loop. If the screen stays black with no crash, these lines name the
+ * guilty stage from the log alone. */
+static void *ios_diag_thread(void *arg)
+{
+    extern int nv2a_vk_diag(void);
+    int i;
+    (void)arg;
+    xbox_thread_name("diag");
+    for (i = 0; i < 12; i++) {
+        sleep(5);
+        fprintf(stderr, "[DIAG] t=%ds renderer=0x%x (1 tried 2 ok 4 headless 8 dyn-vi)\n",
+                (i + 1) * 5, nv2a_vk_diag());
+    }
+    return NULL;
+}
+
+/* Background handshake. SDL2 calls event watchers synchronously inside
+ * UIKit's callback (SDL_OnApplicationWillResignActive / DidEnterBackground)
+ * while it holds its watcher lock. iOS kills an app that commits GPU work
+ * after it is backgrounded, and the poll loop below only sees the window
+ * events after that callback has returned. So the watcher parks the
+ * executor and drains the GPU here, but the wait must stay bounded
+ * (300 ms): a watchdog also kills an app that blocks in the callback.
+ * NFSU2_BG_HANDSHAKE=0: only set the flag (old behaviour; the executor then
+ * parks without a drain). Check the type first; no other SDL calls here. */
+static int s_bg_handshake = 1;
+
+static int ios_bg_watch(void *userdata, void *event)
+{
+    extern int nv2a_vk_background_handshake(int timeout_ms);
+    extern void nv2a_vk_set_background(int bg);
+    uint32_t type = *(uint32_t *)event;
+    (void)userdata;
+    if (type != SDL_APP_WILLENTERBACKGROUND && type != SDL_APP_DIDENTERBACKGROUND)
+        return 1;
+    if (s_bg_handshake)
+        nv2a_vk_background_handshake(300);
+    else
+        nv2a_vk_set_background(1);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
+    pthread_attr_t attr;
+    pthread_t th;
+    int rc = 1;
+    int vblank_lock_on = 1;
+
     (void)argc;
     (void)argv;
-    return game_main();
+    /* Redirect the log FIRST so main-thread init output is captured. */
+    ios_log_to_documents();
+    setvbuf(stderr, NULL, _IONBF, 0);
+    xbox_thread_name("main");
+    xbox_app_log("build " NFSU_BUILD_TAG " (" NFSU_BUILD_NOTE ")\n");
+    xbox_app_log("HOME=%s TMPDIR=%s\n",
+            getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
+            getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
+    {
+        /* SA_ONSTACK: a guest-thread stack overflow must still reach the
+         * handler (plain signal() would die on the overflowed stack). */
+        struct sigaction sa;
+        static char crash_stack[SIGSTKSZ * 4];
+        stack_t ss;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = ios_crash_handler;
+        sa.sa_flags = SA_ONSTACK;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        sigaction(SIGILL, &sa, NULL);
+        sigaction(SIGABRT, &sa, NULL);
+        ss.ss_sp = crash_stack;
+        ss.ss_size = sizeof crash_stack;
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    }
+    /* Env and cwd BEFORE SDL_CreateWindow: SDL's iOS Vulkan loader calls
+     * vkEnumerateInstanceExtensionProperties inside SDL_CreateWindow, and
+     * MoltenVK reads its MVK_CONFIG_* environment once, on first use. A
+     * setenv after that is ignored. */
+    {
+        /* Relative cache paths (progcache.bin, vkspirv.bin,
+         * vkpipecache.bin) resolve against the cwd, which is read-only
+         * on iOS. chdir into Documents so they persist across launches;
+         * NFSU2_GAME_DIR overrides still win inside game_main. */
+        const char *gd = getenv("NFSU2_GAME_DIR");
+        const char *docs = NSTemporaryDirectory_path("Documents");
+        if (chdir(gd && gd[0] ? gd : docs) == 0) {
+            /* Settings live right there: <id>_env.txt. */
+            const char *cfgdir = gd && gd[0] ? gd : docs;
+            const char *old_name = NFSU_SETTINGS_FILE_LEGACY;
+            char cfgp[1100], cfgold[1100];
+            snprintf(cfgp, sizeof cfgp, "%s/%s", cfgdir, NFSU_SETTINGS_FILE);
+            if (old_name)
+                snprintf(cfgold, sizeof cfgold, "%s/%s", cfgdir, old_name);
+            cfg_load(cfgp, old_name ? cfgold : NULL);
+            xbox_app_log("cwd %s (caches persist)\n",
+                    gd && gd[0] ? gd : docs);
+        }
+    }
+    {
+        /* Launch screen: AFTER cfg_load, BEFORE the defaults below, the
+         * window and every thread. Off by default (v29); shown when
+         * NFSU2_LAUNCHER=1, and always when there is no game data (it is the
+         * only guidance for that). It runs on this thread only, writes its
+         * choices with nfsu2_cfg_set (table + file, no setenv) and returns
+         * on Play; the changed keys are then exported once with overwrite
+         * (safe: no other thread exists yet). Any failure inside the
+         * launcher is logged there and we go straight on to the game. The
+         * skip path creates nothing the window needs (SDL builds its own
+         * UIWindow), so it is the same flow as v13-v23. */
+        extern int ios_launcher_run(void);
+        char dd[1200];
+        int no_data = nfsu2_game_data_status(dd, sizeof dd) == 0;
+        if (no_data || nfsu2_launcher_enabled()) {
+            xbox_app_log(no_data ? "launch screen shown: no game data\n"
+                                 : "launch screen shown (NFSU2_LAUNCHER=1)\n");
+            xbox_app_log("launch screen %s\n",
+                    ios_launcher_run() ? "done (Play)" : "not shown");
+            nfsu2_cfg_export_changed();
+        } else {
+            xbox_app_log("launch screen off (NFSU2_LAUNCHER=1 shows it)\n");
+        }
+    }
+    {
+        /* Default render scale 2 on iOS (A17 has the fill rate; 480p
+         * upscaled looks soft). cfg_load's bridge and the launch screen's
+         * export ran first, so an explicit key always wins. */
+        if (!getenv("RECOMP_GL_SCALE"))
+            setenv("RECOMP_GL_SCALE", "2", 0);
+        /* Async queue submits: the default (1) encodes inside
+         * vkQueueSubmit on the calling thread, which then waits for the
+         * CAMetalLayer drawable. Overwrite 0: a key in nfsu2_env.txt
+         * wins; =1 restores synchronous submits for A/B. */
+        setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+        xbox_app_log("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=%s\n",
+                getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS"));
+        /* MoltenVK log level 1 = errors only. Level 2 (default) prints
+         * "[mvk-warn] Metal does not support disabling primitive restart"
+         * for every pipeline (123 lines in one short session). Same
+         * rule: read once, so it must precede SDL_CreateWindow. */
+        setenv("MVK_CONFIG_LOG_LEVEL", "1", 0);
+        /* iOS defaults, set here on the main thread before any other
+         * thread reads the environment; a key in nfsu2_env.txt wins.
+         * Frame lag: the game waits on the previous frame's fence, so game
+         * code and the executor overlap (Eden race 9-18 -> 21-24 fps; the
+         * log says "[D3D] frame fence: previous frame"). Quiet: every log
+         * line is an unbuffered write to Documents; drop the kernel and
+         * executor chatter, as on the Switch. */
+        setenv("RECOMP_FRAME_LAG", "1", 0);
+        setenv("RECOMP_QUIET", "1", 0);
+        /* 60 fps races (v27): present every vblank. The panel row has
+         * def_on = 1 to match; a "0" in nfsu2_env.txt still wins. */
+        setenv("RECOMP_PRESENT_INTERVAL", "1", 0);
+        game_env_defaults();   /* per game; the panel rows show the same */
+    }
+    {
+        extern void nv2a_vk_set_window(void *win);
+        extern void nv2a_vk_set_surface_hook(void (*fn)(void *win));
+        extern void ios_drawable_after_surface(void *sdl_window);
+        SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+        /* Defer all edge gestures: a steering thumb sliding off the bottom
+         * edge must not leave the game. */
+        SDL_SetHint("SDL_IOS_HIDE_HOME_INDICATOR", "2");
+        SDL_InitSubSystem(SDL_INIT_VIDEO);
+        /* Drawable size (v29): without ALLOW_HIGHDPI SDL sets the layer's
+         * contentsScale to 1.0 and MoltenVK's surface extent is the size in
+         * points. Decided here, on the main thread, before the window (and
+         * before any thread starts: it reads NFSU2_POINT_RES). */
+        extern int ios_point_res_wanted(char *desc, size_t n);
+        char prdesc[96];
+        int point_res = ios_point_res_wanted(prdesc, sizeof prdesc);
+        xbox_app_log("drawable at %s (%s)\n",
+                point_res ? "point resolution" : "native pixels", prdesc);
+        xbox_app_log("creating SDL window on main thread\n");
+        void *win = SDL_CreateWindow(NFSU_SHORT_NAME, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                     1280, 720,
+                                     SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+                                     (point_res ? 0 : SDL_WINDOW_ALLOW_HIGHDPI));
+        xbox_app_log("window=%p (%s)\n", win, win ? "ok" : SDL_GetError());
+        nv2a_vk_set_window(win);
+        /* Screen buffer at render size (v32): after the Vulkan surface exists
+         * and before the swapchain, ios_launcher.m shrinks the Metal layer's
+         * drawable to about the render size. */
+        nv2a_vk_set_surface_hook(ios_drawable_after_surface);
+        if (!win)
+            xbox_app_log("FATAL no window; refusing off-main fallback\n");
+        else {
+            extern int nv2a_vk_init_on_main(void);
+            xbox_app_log("eager renderer init on main thread\n");
+            int ok = nv2a_vk_init_on_main();
+            xbox_app_log("eager init %s\n", ok ? "ok" : "FAILED (headless)");
+            /* Overlay AFTER renderer init: SDL reassigns rootViewController's
+             * view when the Metal view is created, which would bury the
+             * overlay under the render view if installed earlier. */
+            struct sdl_syswm_info smi;
+            memset(&smi, 0, sizeof smi);
+            smi.version_major = 2; smi.version_minor = 30; smi.version_patch = 9;
+            /* NFSU2_OVERLAY=0 (nfsu2_env.txt, loaded above): skip the whole
+             * UIKit overlay -- drawings, gear/settings panel, haptics, tilt
+             * and the keyboard observer (ios_keyboard_install runs from it).
+             * Touch input itself still works. A way in if the overlay ever
+             * breaks launch. */
+            const char *ov = getenv("NFSU2_OVERLAY");
+            if (ov && ov[0] == '0') {
+                extern void ios_power_timer_start(void);   /* the overlay's fpsTick samples otherwise */
+                xbox_app_log("touch overlay off (NFSU2_OVERLAY=0)\n");
+                ios_power_timer_start();
+            } else if (SDL_GetWindowWMInfo(win, &smi) && smi.subsystem == SDL_SYSWM_UIKIT) {
+                extern void ios_touch_overlay_install(void *uiwindow);
+                ios_touch_overlay_install(smi.info.uikit.window);
+                xbox_app_log("touch overlay installed\n");
+            } else {
+                extern void ios_power_timer_start(void);
+                xbox_app_log("touch overlay unavailable (syswm=%u)\n", smi.subsystem);
+                ios_power_timer_start();
+            }
+        }
+    }
+    {
+        /* After the renderer's eager init, before the game thread starts. */
+        const char *hs = getenv("NFSU2_BG_HANDSHAKE");
+        s_bg_handshake = !(hs && hs[0] == '0');
+        SDL_AddEventWatch(ios_bg_watch, NULL);
+        xbox_app_log("background handshake %s\n",
+                s_bg_handshake ? "on" : "off (flag only)");
+    }
+    /* Read before the game thread exists: game_main setenv()s more keys. */
+    {
+        const char *vl = getenv("NFSU2_VBLANK_LOCK");
+        vblank_lock_on = !(vl && vl[0] == '0');
+        if (!vblank_lock_on)
+            xbox_app_log("vblank display lock off (NFSU2_VBLANK_LOCK=0)\n");
+    }
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16u * 1024 * 1024);
+    if (pthread_create(&th, &attr, ios_game_thread, &rc) == 0) {
+        pthread_t dth;
+        pthread_create(&dth, NULL, ios_diag_thread, NULL);
+        pthread_detach(dth);
+        if (vblank_lock_on) {
+            /* v27: display vsync timestamps for the guest vblank (own
+             * thread; the kernel timer thread consumes them). The samples
+             * wait in a ring until the timer thread runs. */
+            extern void ios_vblank_link_start(void);
+            ios_vblank_link_start();
+        }
+        /* SDL_Event is opaque here (main.c avoids SDL.h): 64 bytes is its
+         * sizeof on every SDL2 target. */
+        char ev[64] __attribute__((aligned(16)));
+        for (;;) {
+            int got;
+            /* Blocks; also keeps the SDL/UIKit state serviced. */
+            while (!(got = SDL_PollEvent(ev))) {
+                struct timespec ts = { 0, 16 * 1000 * 1000 };
+                nanosleep(&ts, NULL);
+            }
+            if (!got)
+                break;
+            {
+                struct sdl_winev *we = (struct sdl_winev *)ev;
+                extern void nv2a_vk_set_background(int bg);
+                extern void nv2a_vk_mark_swapchain_dirty(void);
+                if (we->type == SDL_QUIT) {
+                    xbox_app_log("SDL_QUIT\n");
+                    break;
+                }
+                if (we->type == SDL_WINDOWEVENT) {
+                    /* SDL2 SDL_WINDOWEVENT_* : 1=SHOWN 2=HIDDEN 3=EXPOSED
+                     * 5=RESIZED 6=SIZE_CHANGED 7=MINIMIZED 9=RESTORED
+                     * 12=FOCUS_GAINED 13=FOCUS_LOST. Set the background flag
+                     * on HIDDEN/MINIMIZED/FOCUS_LOST; clear it ONLY on the
+                     * explicit foreground events (RESTORED/FOCUS_GAINED) so
+                     * incidental events never un-pause a hidden app. */
+                    xbox_app_log("windowevent %d\n", we->ev);
+                    if (we->ev == 2 || we->ev == 7 || we->ev == 13)
+                        nv2a_vk_set_background(1);
+                    else if (we->ev == 9 || we->ev == 12)
+                        nv2a_vk_set_background(0);
+                    if (we->ev == 6) {
+                        /* Rotation: the swapchain extent is now stale; the
+                         * next flip recreates it before acquiring. */
+                        nv2a_vk_mark_swapchain_dirty();
+                    }
+                }
+            }
+        }
+        pthread_join(th, NULL);
+    } else {
+        fprintf(stderr, "[FATAL] cannot start the game thread\n");
+    }
+    return rc;
+}
+#else
+/* POSIX (Linux host proof): the game on a big thread, main joins. */
+#include <pthread.h>
+static void *linux_game_thread(void *arg)
+{
+    (void)arg;
+    xbox_thread_name("game");
+    game_main();
+    return NULL;
+}
+
+int main(int argc, char **argv)
+{
+    pthread_attr_t attr;
+    pthread_t th;
+    int rc = 1;
+
+    (void)argc;
+    (void)argv;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16u << 20);
+    if (pthread_create(&th, &attr, linux_game_thread, NULL) == 0) {
+        pthread_join(th, NULL);
+        rc = 0;
+    } else {
+        fprintf(stderr, "[FATAL] cannot start the game thread\n");
+    }
+    return rc;
 }
 #endif
 
@@ -297,11 +1284,20 @@ static int game_main(void)
     const char *game_dir;
     void *xbe_data;
     size_t xbe_size = 0;
+#ifdef NFSU2_IOS
+    ios_log_to_documents();
+    setvbuf(stderr, NULL, _IONBF, 0);
+    xbox_app_log("build " NFSU_BUILD_TAG " (" NFSU_BUILD_NOTE ")\n");
+    xbox_app_log("HOME=%s CFFIXED_USER_HOME=%s TMPDIR=%s\n",
+            getenv("HOME") ? getenv("HOME") : "(unset)",
+            getenv("CFFIXED_USER_HOME") ? getenv("CFFIXED_USER_HOME") : "(unset)",
+            getenv("TMPDIR") ? getenv("TMPDIR") : "(unset)");
+#endif
 
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("=== Need for Speed: Underground 2 (Xbox) - static recompilation ===\n");
+    printf("=== " NFSU_LONG_NAME " (Xbox) - static recompilation ===\n");
     install_crash_reporter();
     if (getenv("NFSU2_EXIT_TRACE"))
         atexit(print_guest_state);
@@ -320,6 +1316,7 @@ static int game_main(void)
     setenv("RECOMP_USB", "1", 0);       /* the pad is on the MCPX's OHCI */
     setenv("RECOMP_PB_EXEC", "1", 0);   /* the title draws through NV2A */
 #endif
+    game_env_defaults();                /* per game (game_profile.h) */
 #if defined(__SWITCH__)
     /* Every periodic log line flushes to the SD card; keep the log to what
      * matters on a console. RECOMP_QUIET=0 in nfsu2x_env.txt brings it back. */
@@ -329,13 +1326,67 @@ static int game_main(void)
     game_dir = getenv("NFSU2_GAME_DIR");
     if (!game_dir || !game_dir[0])
         game_dir = NFSU2_DEFAULT_GAME_DIR;
-    snprintf(xbe_path, sizeof(xbe_path), "%s/default.xbe", game_dir);
+#ifdef NFSU2_IOS
+    /* Files pushed from a PC often land one level deeper than expected.
+     * Before failing, probe the layouts people actually produce. */
+    {
+        char probe[1100];
+        FILE *f;
+        size_t i;
+        int found = 0;
 
-    xbe_data = load_file(xbe_path, &xbe_size);
+        snprintf(probe, sizeof probe, "%s/default.xbe", game_dir);
+        f = fopen(probe, "rb");
+        if (f) { fclose(f); found = 1; }
+        for (i = 0; !found && i < sizeof nfsu2_ios_alts / sizeof nfsu2_ios_alts[0]; i++) {
+            snprintf(nfsu2_ios_gamedir, sizeof nfsu2_ios_gamedir,
+                     "%s/%s", game_dir, nfsu2_ios_alts[i]);
+            snprintf(probe, sizeof probe, "%s/default.xbe", nfsu2_ios_gamedir);
+            f = fopen(probe, "rb");
+            if (f) {
+                fclose(f);
+                game_dir = nfsu2_ios_gamedir;
+                found = 1;
+            }
+        }
+        if (!found)
+            xbox_app_log("no default.xbe under %s (probed subdirs)\n",
+                    game_dir);
+    }
+#endif
+    snprintf(xbe_path, sizeof(xbe_path), "%s/default.xbe", game_dir);
+#ifdef NFSU2_IOS
+    xbox_app_log("game dir = %s\n", game_dir);
+    xbox_app_log("loading %s\n", xbe_path);
+#endif
+
+    /* A disc image (.iso) instead of the extracted folder. After the iOS
+     * layout probe so a folder that holds default.xbe still wins. If the image
+     * has no usable default.xbe the folder path below is tried. */
+    xbe_data = NULL;
+    if (xiso_autodetect(game_dir)) {
+        xbe_data = xiso_read_file("default.xbe", &xbe_size);
+        if (!xbe_data) {
+            fprintf(stderr, "[XISO] no default.xbe in %s, using the game folder\n",
+                    xiso_image_path());
+            xiso_unmount();
+        } else if (!check_disc_identity((const uint8_t *)xbe_data, xbe_size)) {
+            fatal("This disc image is not " NFSU_LONG_NAME " "
+                  "(NTSC-U Xbox). See the log for the title ID found.");
+            free(xbe_data);
+            xiso_unmount();
+            return 1;
+        } else {
+            snprintf(xbe_path, sizeof(xbe_path), "%s:/default.xbe",
+                     xiso_image_path());
+        }
+    }
+    if (!xbe_data)
+        xbe_data = load_file(xbe_path, &xbe_size);
     if (!xbe_data) {
         fprintf(stderr, "cannot read %s\n", xbe_path);
-        fatal("Failed to load default.xbe. Put the extracted disc in the game "
-              "directory (or set NFSU2_GAME_DIR).");
+        fatal("Failed to load default.xbe. Put the extracted disc or a single .iso in the game "
+              "directory (or set NFSU2_GAME_DIR / NFSU2_ISO).");
         return 1;
     }
     printf("XBE %s: %zu bytes\n", xbe_path, xbe_size);
@@ -349,7 +1400,15 @@ static int game_main(void)
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped at host offset 0x%llX\n",
            (unsigned long long)g_xbox_mem_offset);
+#ifndef __SWITCH__
+    /* Here and not in main(): started from main() it ran while the layout
+     * maps its fixed ranges, and the contiguous window failed to map (seen on
+     * Linux). This thread also owns the setenv()s, so the getenv() inside
+     * does not race. [cpu] line every RECOMP_CPU_LOG s (iOS: 10). */
+    cpu_report_start();
+#endif
 
+#if NFSU_HAS_SIM_STEP_CAP
     /* Game time per frame is capped: sub_001890C0 takes the real elapsed
      * time but at most 3.0 (the .data float at 0x3A4C64, read nowhere else)
      * x 1/60 s = 50 ms, and drops the rest. Below 20 fps the game ran slower
@@ -360,13 +1419,14 @@ static int game_main(void)
         const char *e = getenv("NFSU2_SIM_STEPS");
         float steps = e ? (float)atof(e) : 6.0f;
         if (steps >= 1.0f && steps <= 30.0f) {
-            float *cap = (float *)((uint8_t *)xbox_GetMemoryBase() + 0x3A4C64);
+            float *cap = (float *)((uint8_t *)xbox_GetMemoryBase() + NFSU_SIM_STEP_CAP_VA);
             if (*cap == 3.0f) {
                 *cap = steps;
                 printf("[BOOT] game time cap %.0f ms per frame\n", steps * 1000.0f / 60.0f);
             }
         }
     }
+#endif /* NFSU_HAS_SIM_STEP_CAP */
 
     /* The emulated APU. DirectSound's accesses reach it through the MMIO
      * accessors the DSOUND section is lifted with (regen.sh passes
@@ -419,8 +1479,14 @@ static int game_main(void)
 #endif
 
     xbox_kernel_init();
+#if NFSU_HAS_TEXT_PATCH
     nfsu2_text_patch_init();
+#endif
+#ifdef NFSU2_IOS
+    xbox_path_init(game_dir, ios_save_dir());
+#else
     xbox_path_init(game_dir, NFSU2_DEFAULT_SAVE_DIR);
+#endif
     xbox_kernel_bridge_init();
 
     g_esp = XBOX_STACK_TOP;

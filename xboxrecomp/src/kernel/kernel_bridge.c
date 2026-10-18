@@ -29,6 +29,7 @@
 #include "xbox_memory_layout.h"
 #include "guest_vmem.h"
 #include "recomp_icall_feedback.h"
+#include "platform/cpu_report.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -299,7 +300,7 @@ static void kernel_data_init(void)
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE)      = XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE;
 
     /* KeTimeIncrement (ordinal 157) - 100ns units per clock tick. 0x2710 is
-     * 1 ms, which is what KeTickCount above is updated at. A title dividing by
+     * 1 ms, the unit of KeTickCount above. A title dividing by
      * this to convert ticks to time gets a division by zero if it is left 0. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TIME_INCREMENT) = 0x2710;
 
@@ -579,20 +580,46 @@ static uint32_t guest_thread_by_tid(DWORD tid)
  * per thread: t_gil_depth counts entries, and a kernel call parks the whole
  * count and restores it. */
 static CRITICAL_SECTION   s_gil_cs;
-static CONDITION_VARIABLE s_gil_cv;
 static volatile uint64_t  s_gil_next, s_gil_serving;
 static volatile int       s_gil_on = -1;
 static RECOMP_TLS int     t_gil_depth;
+
+/* Who wakes when the lock is handed over.
+ *
+ * One condition variable woke every waiter at every handover. Each compared
+ * its ticket with s_gil_serving and all but one went back to sleep: in the
+ * intro movies (9000 handovers a second between the game and the EA mixer)
+ * and with a dozen guest threads parked, that was thousands of wakeups a
+ * second that did no work. They keep the CPU out of deep idle, which is heat
+ * on a phone.
+ *
+ * Now a waiter with ticket `me` sleeps on s_gil_cvs[me & 15] and the unlock
+ * wakes only the one for the ticket now served. With more than 16 waiters
+ * a thread of ticket serving+16 may wake with it and sleep again. The order
+ * (FIFO) and every other rule stay as they were.
+ *
+ * RECOMP_GIL_WAKE_ALL=1 gives the old behaviour: one condition variable,
+ * woken for all, 1 ms timeouts. It is read once, with the lock's init, so
+ * waiters and unlock always agree. */
+#define GIL_CVS 16
+static CONDITION_VARIABLE s_gil_cvs[GIL_CVS];
+static int                s_gil_wake_all;
 
 static int gil_enabled(void)
 {
     if (s_gil_on < 0) {
         const char *e = getenv("RECOMP_GIL");
+        const char *wa = getenv("RECOMP_GIL_WAKE_ALL");
+        int k;
         InitializeCriticalSection(&s_gil_cs);
-        InitializeConditionVariable(&s_gil_cv);
+        for (k = 0; k < GIL_CVS; k++)
+            InitializeConditionVariable(&s_gil_cvs[k]);
+        s_gil_wake_all = wa && *wa == '1';
         s_gil_on = !(e && *e == '0');
         if (s_gil_on)
             fprintf(stderr, "  [THREAD] guest code serialised under one lock (RECOMP_GIL)\n");
+        if (s_gil_on && s_gil_wake_all)
+            fprintf(stderr, "  [THREAD] guest lock wakes every waiter (RECOMP_GIL_WAKE_ALL)\n");
     }
     return s_gil_on;
 }
@@ -664,6 +691,7 @@ static void gil_lock(void)
 {
     uint64_t me;
     int eager = gil_eager(), prio = eager ? gil_prio_now() : 0, counted = 0;
+    int timed_out = 0;
     EnterCriticalSection(&s_gil_cs);
     me = s_gil_next++;
     if (me != s_gil_serving && eager) {
@@ -678,9 +706,22 @@ static void gil_lock(void)
     if (me != s_gil_serving && xbox_thread_holds_dispatch()) {
         g_gil_contended = 1;
     }
-    while (me != s_gil_serving)
-        if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
+    /* The first wait is 1 ms: if the ticket is still not served then, the
+     * flag goes up (above). It stays up while this thread waits: a new
+     * holder clears it only when nobody is behind it, and this thread is.
+     * So in the default mode the later waits are a safety net of 20 ms, not
+     * a timer. In eager mode a new holder recomputes the flag, and lower
+     * waiters must raise it again: 1 ms every time. A wake meant for
+     * another ticket on the same condition variable does not count as the
+     * first timeout. */
+    while (me != s_gil_serving) {
+        DWORD ms = (timed_out && !eager && !s_gil_wake_all) ? 20 : 1;
+        if (!SleepConditionVariableCS(&s_gil_cvs[s_gil_wake_all ? 0 : (me & (GIL_CVS - 1))],
+                                      &s_gil_cs, ms)) {
             g_gil_contended = 1;           /* 1 ms and still waiting */
+            timed_out = 1;
+        }
+    }
     if (eager) {
         if (counted)
             s_gil_waiting[prio]--;
@@ -698,13 +739,18 @@ static void gil_lock(void)
         g_gil_contended = 0;               /* nobody behind us */
     }
     LeaveCriticalSection(&s_gil_cs);
+    /* Guest code reads KeTickCount from memory. The tick thread writes it
+     * only every few milliseconds (RECOMP_TICK_MS), so a thread that
+     * resumes -- after a kernel call, a yield, a DPC or an ISR -- stores a
+     * fresh value first: one clock read and one compare-and-swap. */
+    xbox_tick_refresh();
 }
 
 static void gil_unlock(void)
 {
     EnterCriticalSection(&s_gil_cs);
     s_gil_serving++;
-    WakeAllConditionVariable(&s_gil_cv);
+    WakeAllConditionVariable(&s_gil_cvs[s_gil_wake_all ? 0 : (s_gil_serving & (GIL_CVS - 1))]);
     LeaveCriticalSection(&s_gil_cs);
 }
 
@@ -743,13 +789,227 @@ void xbox_gil_resume(int depth)
     }
 }
 
-/* RECOMP_SPIN_HINT's periodic yield: a poll loop waits for another thread,
- * an interrupt or a DPC -- all of which need the lock. */
-void recomp_spin_yield(void)
+/* A plain yield: let every other guest thread, ISR and DPC have the lock. */
+static void gil_yield(void)
 {
     int d = xbox_gil_suspend();
     SwitchToThread();
     xbox_gil_resume(d);
+}
+
+/* ── Sleeping in a D3D fence wait ────────────────────────────
+ *
+ * The title's fence wait (D3D BlockOnTime) polls the GPU semaphore until it
+ * reaches the fence. The poll loop's yield above only hands over the guest
+ * lock, so the thread still ran a core flat out for as long as the GPU
+ * took. On a phone that is heat and battery, and it competes with the
+ * renderer for the cores.
+ *
+ * The wrapper around the wait (recomp_manual.c) says which semaphore and
+ * which fence this thread waits for. The poll loop's yield then sleeps on a
+ * condition variable instead, for a few milliseconds at most, and the pushbuffer
+ * executor broadcasts it as it writes the semaphore (recomp_fence_signal).
+ * The wait is re-checked under the mutex after the waiter count went up, so
+ * a release between the loop's last read and the sleep is not lost.
+ *
+ * Waits nest: D3D's ring-space path (sub_002E8E60 -> 0x2E91D0 -> 0x2E9090)
+ * calls the wrapped function again from inside a wait. Only the innermost
+ * one is the loop that polls.
+ *
+ * Other poll loops reached from inside a wait take the same sleep: the
+ * PGRAPH pattern-colour poll in D3D's fence helper (the executor latches
+ * that register just ahead of the semaphore release, so the wake lands a
+ * method later). The kickoff's flush poll is answered by recomp_spin_wake
+ * and then only yields. One that waits for anything else is capped by the
+ * millisecond. The loop compares against the fence of a ring record
+ * (sub_002E8A50) on one path, not the argument; that is the argument's own
+ * fence or a later one, and a later one only makes the test here false
+ * earlier, which is the plain yield again.
+ *
+ * The millisecond became 4: the executor's signal ends the sleep at once, so
+ * the timeout only covers a wake that does not come. A device log (NFSU1,
+ * menus) showed 5929 of 6542 sleeps in 10 s ending on the timeout: the thread
+ * woke every millisecond of a 13 ms wait to sleep again.
+ * RECOMP_FENCE_SLEEP_US=<us> sets it (1000 = the old value).
+ *
+ * RECOMP_FENCE_SLEEP=0 gives the plain yield again. Windows keeps it. */
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <time.h>
+
+void recomp_spin_wake(void);        /* xbox_memory_layout.c */
+unsigned recomp_spin_flush_acks(void);
+
+#define FENCE_NEST 4
+static RECOMP_TLS struct {
+    uint32_t sem_va, wseq_va, fence;
+    uint64_t t0;                    /* RECOMP_FPS_LOG: wait started */
+} t_fence[FENCE_NEST];
+static RECOMP_TLS unsigned t_flush_seen;    /* recomp_spin_flush_acks at the last sleep */
+static RECOMP_TLS int t_fence_depth;        /* waits open, may exceed FENCE_NEST */
+static pthread_mutex_t s_fence_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_fence_cond = PTHREAD_COND_INITIALIZER;
+static int      s_fence_waiters;            /* atomic: threads in the cond wait */
+static unsigned s_fence_sleeps, s_fence_timeouts;   /* atomic, RECOMP_FPS_LOG */
+
+static int fence_sleep_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FENCE_SLEEP");
+        on = !(e && *e == '0');
+        fprintf(stderr, on ? "[D3D] fence wait: sleep on the GPU semaphore "
+                             "(RECOMP_FENCE_SLEEP=0 spins)\n"
+                           : "[D3D] fence wait: spin (RECOMP_FENCE_SLEEP=0)\n");
+    }
+    return on;
+}
+
+/* The safety timeout of one sleep, in microseconds; default 4000. Read once. */
+static long fence_sleep_us(void)
+{
+    static long us = -1;
+    if (us < 0) {
+        const char *e = getenv("RECOMP_FENCE_SLEEP_US");
+        long v = e ? atol(e) : 0;
+        us = v >= 100 && v <= 100000 ? v : 4000;
+        if (us != 4000)
+            fprintf(stderr, "[D3D] fence sleep timeout %ld us (RECOMP_FENCE_SLEEP_US)\n", us);
+    }
+    return us;
+}
+
+/* RECOMP_FPS_LOG=1: waits, wall time in them and sleeps, every 10 s. */
+static int fence_log_on(void)
+{
+    static int log = -1;
+    if (log < 0) {
+        const char *e = getenv("RECOMP_FPS_LOG");
+        log = e && *e == '1';
+    }
+    return log;
+}
+
+static uint64_t fence_now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+}
+
+void recomp_fence_wait_begin(uint32_t sem_va, uint32_t wseq_va, uint32_t fence)
+{
+    int i = t_fence_depth++;
+    if (i >= FENCE_NEST)
+        return;
+    t_fence[i].t0 = i == 0 && fence_log_on() ? fence_now_ns() : 0;
+    /* sem_va 0 = no semaphore (no device yet): never sleeps. */
+    t_fence[i].sem_va = fence_sleep_on() ? sem_va : 0;
+    t_fence[i].wseq_va = wseq_va;
+    t_fence[i].fence = fence;
+}
+
+static void fence_log_counts(uint64_t waited_ns)
+{
+    static uint64_t last_ns, wait_ns;
+    static unsigned waits;
+    uint64_t now = fence_now_ns();
+    wait_ns += waited_ns;
+    waits++;
+    if (now - last_ns >= 10000000000ull) {
+        if (last_ns)
+            fprintf(stderr, "[D3D] fence waits %u, %.0f ms in them (game thread); "
+                            "sleeps %u, timed out %u\n",
+                    waits, wait_ns / 1e6,
+                    __atomic_exchange_n(&s_fence_sleeps, 0, __ATOMIC_RELAXED),
+                    __atomic_exchange_n(&s_fence_timeouts, 0, __ATOMIC_RELAXED));
+        last_ns = now;
+        wait_ns = 0;
+        waits = 0;
+    }
+}
+
+void recomp_fence_wait_end(void)
+{
+    int i = --t_fence_depth;
+    if (i == 0 && t_fence[0].t0)
+        fence_log_counts(fence_now_ns() - t_fence[0].t0);
+}
+
+/* The innermost wait, if it is one this thread records. */
+static int fence_cur(void)
+{
+    int i = t_fence_depth - 1;
+    return i >= 0 && i < FENCE_NEST && t_fence[i].sem_va ? i : -1;
+}
+
+/* The lifted loop's test (unsigned): wseq - fence below wseq - semaphore. */
+static int fence_behind(int i)
+{
+    uint32_t w = BRIDGE_MEM32(t_fence[i].wseq_va);
+    uint32_t s = __atomic_load_n((volatile uint32_t *)((uintptr_t)t_fence[i].sem_va
+                                 + g_xbox_mem_offset), __ATOMIC_ACQUIRE);
+    return (w - t_fence[i].fence) < (w - s);
+}
+
+static void fence_sleep(int i)
+{
+    struct timespec ts;
+    int d, timed_out = 0;
+
+    recomp_spin_wake();
+    /* A kickoff's flush poll that this wake just answered is done: no sleep. */
+    if (recomp_spin_flush_acks() != t_flush_seen) {
+        t_flush_seen = recomp_spin_flush_acks();
+        gil_yield();
+        return;
+    }
+    d = xbox_gil_suspend();
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += fence_sleep_us() * 1000L;
+    while (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&s_fence_lock);
+    __atomic_add_fetch(&s_fence_waiters, 1, __ATOMIC_SEQ_CST);
+    if (fence_behind(i))
+        timed_out = pthread_cond_timedwait(&s_fence_cond, &s_fence_lock, &ts) != 0;
+    __atomic_sub_fetch(&s_fence_waiters, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&s_fence_lock);
+    xbox_gil_resume(d);
+    __atomic_add_fetch(&s_fence_sleeps, 1, __ATOMIC_RELAXED);
+    if (timed_out)
+        __atomic_add_fetch(&s_fence_timeouts, 1, __ATOMIC_RELAXED);
+}
+
+/* The executor, right after it stored a semaphore release. */
+void recomp_fence_signal(void)
+{
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);    /* the store, then the count */
+    if (!__atomic_load_n(&s_fence_waiters, __ATOMIC_SEQ_CST))
+        return;
+    pthread_mutex_lock(&s_fence_lock);
+    pthread_cond_broadcast(&s_fence_cond);
+    pthread_mutex_unlock(&s_fence_lock);
+}
+#else
+void recomp_fence_wait_begin(uint32_t sem_va, uint32_t wseq_va, uint32_t fence)
+{ (void)sem_va; (void)wseq_va; (void)fence; }
+void recomp_fence_wait_end(void) { }
+void recomp_fence_signal(void) { }
+#define fence_cur() (-1)
+#define fence_behind(i) 0
+#define fence_sleep(i) gil_yield()
+#endif
+
+/* RECOMP_SPIN_HINT's periodic yield: a poll loop waits for another thread,
+ * an interrupt or a DPC -- all of which need the lock. Inside a fence wait
+ * that is still short of its fence it sleeps instead. */
+void recomp_spin_yield(void)
+{
+    int i = fence_cur();
+    if (i >= 0 && fence_behind(i))
+        fence_sleep(i);
+    else
+        gil_yield();
 }
 
 /* RECOMP_PREEMPT: someone is waiting -- yield, unless this is an ISR or DPC
@@ -762,7 +1022,7 @@ void recomp_preempt(void)
 {
     if (t_gil_depth <= 0 || t_gil_nopreempt || xbox_thread_holds_dispatch())
         return;
-    recomp_spin_yield();
+    gil_yield();
 }
 
 #define GUEST_CALL(f) do { xbox_gil_enter(); (f)(); xbox_gil_leave(); } while (0)
@@ -785,6 +1045,7 @@ struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
     uint32_t tib;          /* allocated at creation: it is also the KTHREAD */
+    uint32_t start_va;     /* the VA the thread is named by (bridge_thread_name_va) */
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -808,6 +1069,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+
+    xbox_thread_namef("g:%08X", (unsigned)s->start_va);
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -887,9 +1150,19 @@ static void pending_start_flush(DWORD creator)
     ReleaseSRWLockExclusive(&g_pending_lock);
 }
 
+/* The VA a guest thread is named by in the host's thread list. XAPI starts
+ * every thread through one trampoline (start routine 0x0021C8E6) and passes
+ * the real routine as StartContext1: when that is code, name by it. */
+static uint32_t bridge_thread_name_va(uint32_t start_routine, uint32_t ctx1)
+{
+    if (ctx1 && (recomp_lookup(ctx1) || recomp_lookup_manual(ctx1)))
+        return ctx1;
+    return start_routine;
+}
+
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
-                                  int create_suspended)
+                                  int create_suspended, uint32_t start_va)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -897,6 +1170,7 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->start_va = start_va;
     s->tib = xbox_AllocThreadTib();
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, CREATE_SUSPENDED, NULL);
@@ -1046,7 +1320,9 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top,
-                                                    (uint8_t)STACK_ARG(7));
+                                                    (uint8_t)STACK_ARG(7),
+                                                    bridge_thread_name_va(start_routine,
+                                                                          start_context1));
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -2898,6 +3174,356 @@ void xbox_vblank_report(double dt, char *buf, size_t n)
     last = c;
 }
 
+/* ── Vblank locked to the display (v27) ──────────────────────────────────
+ *
+ * The free-running 59.94 Hz tick and a 60.00 Hz screen with FIFO present
+ * drift: one frame repeats or slips about every 17 s. A display source (iOS:
+ * a CADisplayLink on its own thread, ios_vblank.m) pushes vsync timestamps
+ * with kernel_vblank_link_sample(). They go through a lock-free ring (one
+ * producer, the timer thread is the only consumer), in THIS file's clock
+ * (vb_now_us): the source pairs the clocks with a simultaneous reading of
+ * kernel_vblank_clock_us(). kernel_vblank_tick itself still runs only on the
+ * timer thread, at DISPATCH: that ordering fixed the Quick Race start hang.
+ *
+ * The timer thread estimates the link period over a ~1 s window (timestamp
+ * span / periods; a per-delta average on +-0.3 ms jitter would swing by
+ * tenths of a Hz) and locks only when it reads 59.5-60.5 Hz (unlock outside
+ * 59.4-60.6): a 30 Hz link (Low Power Mode) or a 120 Hz one stays free. While
+ * locked each tick's step is the link period plus a phase correction of
+ * e/4, bounded to +-0.5 ms, where e is the distance of the next due time to
+ * the nearest link-aligned time. No sample for 3 periods (background, stall)
+ * -> back to 59.94 Hz from the current due time, estimator cleared; it
+ * re-locks after ~0.5 s of fresh samples and walks onto the link phase at
+ * <= 0.5 ms per tick (no burst of ticks). An off-period delta restarts the
+ * window but keeps the last good period; 4 in a row drop the lock.
+ * NFSU2_VBLANK_LOCK=0 drops the samples (read on the timer thread). Without a source nothing here
+ * runs, and nothing is logged. */
+#if defined(__GNUC__)
+#define LK_LOAD(p)     __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define LK_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#else
+#define LK_LOAD(p)     (*(volatile uint32_t *)(p))
+#define LK_STORE(p, v) (*(volatile uint32_t *)(p) = (v))
+#endif
+
+#define LK_RING       16
+#define LK_WIN        64
+#define LK_MIN_N      32          /* samples before the period is trusted */
+#define LK_LOCK_LO    59.5
+#define LK_LOCK_HI    60.5
+#define LK_UNLOCK_LO  59.4
+#define LK_UNLOCK_HI  60.6
+#define LK_MAX_ADJ_US 500.0
+#define LK_IRREG_MAX  4
+
+static uint64_t         s_lk_ring[LK_RING];
+static volatile uint32_t s_lk_head;           /* producer */
+static uint32_t         s_lk_tail;            /* consumer (timer thread) */
+static int              s_lk_enabled = -1;
+
+static struct {
+    int       seen;                 /* any sample ever consumed */
+    int       locked;
+    int       n;                    /* samples in the current window */
+    uint64_t  ts[LK_WIN];           /* circular */
+    uint64_t  last_ts;              /* newest consumed */
+    double    prev_dt;              /* last regular delta */
+    double    period;               /* last good link period, us (0: none) */
+    int       irregular_run;
+    double    carry;                /* sub-microsecond remainder of the step */
+    unsigned  corrections;          /* ticks with |adj| >= 100 us */
+    unsigned  fallbacks;
+    long long log_us;               /* last 10 s line */
+    unsigned  tk_n;                  /* ticks since the last 10 s line */
+    long long tk_first, tk_last;    /* first and last of them, us */
+    double    adj_max, step_min, step_max, phase_sum;
+    unsigned  phase_n;
+} lk;
+
+static int lk_enabled(void)
+{
+    if (s_lk_enabled < 0) {
+        const char *e = getenv("NFSU2_VBLANK_LOCK");
+        s_lk_enabled = !(e && e[0] == '0');
+    }
+    return s_lk_enabled;
+}
+
+/* One vsync timestamp, in kernel_vblank_clock_us() microseconds. Any thread,
+ * ONE producer at a time. */
+void kernel_vblank_link_sample(uint64_t host_us)
+{
+    uint32_t h;
+
+    h = s_lk_head;
+    s_lk_ring[h % LK_RING] = host_us;
+    LK_STORE(&s_lk_head, h + 1);
+}
+
+static double lk_abs(double x) { return x < 0 ? -x : x; }
+static long long lk_round(double x) { return (long long)(x < 0 ? x - 0.5 : x + 0.5); }
+
+static double lk_hz(void)
+{
+    double p = lk.period > 0 ? lk.period : (lk.n >= 2 ? lk.prev_dt : 0);
+    return p > 0 ? 1e6 / p : 0;
+}
+
+static void lk_reset_window(void)
+{
+    lk.n = 0;
+}
+
+static void lk_set_locked(int on, const char *why)
+{
+    if (lk.locked == on)
+        return;
+    lk.locked = on;
+    lk.carry = 0;
+    if (!on)
+        lk.fallbacks++;
+    fprintf(stderr, "[vblank] %s: %s, link %.2f Hz\n", on ? "locked" : "free", why,
+            lk_hz());
+    fflush(stderr);
+}
+
+/* A locked/free decision from the current period estimate. */
+static void lk_decide(void)
+{
+    double hz = lk.period > 0 ? 1e6 / lk.period : 0;
+
+    if (!lk.locked && lk.period > 0 && hz >= LK_LOCK_LO && hz <= LK_LOCK_HI)
+        lk_set_locked(1, "link in range");
+    else if (lk.locked && (lk.period <= 0 || hz < LK_UNLOCK_LO || hz > LK_UNLOCK_HI))
+        lk_set_locked(0, "link out of range");
+}
+
+static void lk_add(uint64_t ts)
+{
+    lk.seen = 1;
+    if (lk.n > 0) {
+        double dt = ts > lk.last_ts ? (double)(ts - lk.last_ts) : -1.0;
+        double ref = lk.period > 0 ? lk.period : (lk.n >= 2 ? lk.prev_dt : 0);
+        int irregular;
+
+        if (dt <= 0)
+            irregular = 1;
+        else if (ref > 0)
+            irregular = lk_abs(dt - ref) > 0.25 * ref;
+        else
+            irregular = dt < 2000.0 || dt > 100000.0;
+        if (irregular) {
+            /* Restart the window; keep the last good period for now. */
+            lk.irregular_run++;
+            lk_reset_window();
+            lk.prev_dt = 0;
+            if (lk.irregular_run >= LK_IRREG_MAX) {
+                lk.period = 0;
+                if (lk.locked)
+                    lk_set_locked(0, "irregular link timestamps");
+            }
+        } else {
+            lk.irregular_run = 0;
+            lk.prev_dt = dt;
+        }
+    }
+    lk.ts[lk.n % LK_WIN] = ts;
+    lk.n++;
+    lk.last_ts = ts;
+    if (lk.n >= LK_MIN_N) {
+        int cnt = lk.n < LK_WIN ? lk.n : LK_WIN;
+        uint64_t oldest = lk.ts[lk.n >= LK_WIN ? lk.n % LK_WIN : 0];
+        double raw = (double)(ts - oldest) / (double)(cnt - 1);
+        lk.period = lk.period > 0 ? lk.period + (raw - lk.period) * 0.25 : raw;
+    }
+    lk_decide();
+}
+
+/* Timer thread, every wake: consume samples, detect a gap, log. */
+static void lk_poll(long long now)
+{
+    uint32_t head = LK_LOAD(&s_lk_head);
+
+    /* NFSU2_VBLANK_LOCK=0: samples are read and dropped. The key is read here,
+     * on the timer thread (the producer thread never calls getenv). */
+    if (!lk_enabled()) {
+        s_lk_tail = head;
+        return;
+    }
+    if (head - s_lk_tail > LK_RING - 2) {      /* overrun: lost samples */
+        s_lk_tail = head - 8;
+        lk_reset_window();
+        lk.prev_dt = 0;
+    }
+    while (s_lk_tail != head) {
+        lk_add(s_lk_ring[s_lk_tail % LK_RING]);
+        s_lk_tail++;
+    }
+    if (!lk.seen)
+        return;
+
+    /* No sample for 3 periods: free-run from here, estimator cleared. */
+    if (lk.n > 0 || lk.locked) {
+        double ref = lk.period > 0 ? lk.period : (lk.prev_dt > 0 ? lk.prev_dt : 16667.0);
+        double gap = (double)(now - (long long)lk.last_ts);
+        if (gap > 3.0 * ref) {
+            char why[48];
+            snprintf(why, sizeof why, "no link sample for %.0f ms", gap / 1000.0);
+            lk_reset_window();
+            lk.period = 0;
+            lk.prev_dt = 0;
+            lk.irregular_run = 0;
+            lk_set_locked(0, why);
+        }
+    }
+
+    if (!lk.log_us) {
+        lk.log_us = now;
+    }
+    if (now - lk.log_us >= 10000000LL) {
+        /* Guest rate from the first and last tick of the window: counting
+         * ticks over the wall window is +-1 tick = +-0.1 Hz. */
+        double ghz = lk.tk_n > 1 && lk.tk_last > lk.tk_first
+                   ? (double)(lk.tk_n - 1) * 1e6 / (double)(lk.tk_last - lk.tk_first) : 0.0;
+
+        fprintf(stderr, "[vblank] %s, link %.2f Hz, guest %.2f Hz, corrections %u, "
+                        "fallbacks %u, phase err avg %.0f us, adj max %.0f us, "
+                        "step min/max %.0f/%.0f us\n",
+                lk.locked ? "locked" : "free", lk_hz(), ghz,
+                lk.corrections, lk.fallbacks,
+                lk.phase_n ? lk.phase_sum / lk.phase_n : 0.0, lk.adj_max,
+                lk.step_max > 0 ? lk.step_min : 0.0, lk.step_max);
+        fflush(stderr);
+        lk.log_us = now;
+        lk.tk_n = 0;
+        lk.adj_max = lk.step_max = lk.phase_sum = 0;
+        lk.step_min = 0;
+        lk.phase_n = 0;
+    }
+}
+
+static void lk_note_tick(long long now)
+{
+    if (!lk.tk_n)
+        lk.tk_first = now;
+    lk.tk_last = now;
+    lk.tk_n++;
+}
+
+/* The interval from this vblank to the next, in us. */
+static long long lk_step(long long due)
+{
+    double step, p, e, adj, next;
+    long long whole;
+
+    if (!lk.locked)
+        return VBLANK_PERIOD_US;
+    p = lk.period;
+    next = (double)due + p;
+    e = (double)(long long)lk.last_ts
+        + (double)lk_round((next - (double)(long long)lk.last_ts) / p) * p - next;
+    adj = e * 0.25;
+    if (adj > LK_MAX_ADJ_US) adj = LK_MAX_ADJ_US;
+    if (adj < -LK_MAX_ADJ_US) adj = -LK_MAX_ADJ_US;
+    if (lk_abs(adj) >= 100.0)
+        lk.corrections++;
+    if (lk_abs(adj) > lk.adj_max)
+        lk.adj_max = lk_abs(adj);
+    lk.phase_sum += e;
+    lk.phase_n++;
+    step = p + adj + lk.carry;
+    whole = (long long)step;
+    lk.carry = step - (double)whole;
+    if (!lk.step_max || (double)whole < lk.step_min) lk.step_min = (double)whole;
+    if ((double)whole > lk.step_max) lk.step_max = (double)whole;
+    return whole;
+}
+
+/* The clock samples must be given in. */
+long long kernel_vblank_clock_us(void)
+{
+    return vb_now_us();
+}
+
+/* RECOMP_VBLANK_LINK_TEST=1 (any host): a fake display at exactly 60.00 Hz
+ * with +-0.3 ms timestamp jitter. At RECOMP_VBLANK_LINK_TEST_GAP_AT seconds
+ * (default 90) it stops for RECOMP_VBLANK_LINK_TEST_GAP_S seconds (default
+ * 2), then resumes on a phase 7 ms later. RECOMP_VBLANK_LINK_TEST_HZ=
+ * "30@30,60@60" switches the rate (Low Power Mode, 120 Hz): hz@seconds. */
+static DWORD WINAPI lk_test_thread(LPVOID unused)
+{
+    xbox_thread_name("lk-test");
+    const char *g = getenv("RECOMP_VBLANK_LINK_TEST_GAP_AT");
+    double gap_at = g && atof(g) > 0 ? atof(g) : 90.0;
+    const char *gl = getenv("RECOMP_VBLANK_LINK_TEST_GAP_S");
+    double gap_s = gl && atof(gl) > 0 ? atof(gl) : 2.0;
+    const char *hs = getenv("RECOMP_VBLANK_LINK_TEST_HZ");
+    double sched_hz[8], sched_t[8];
+    int nsched = 0, si = 0;
+    double per = 1e6 / 60.0;
+    long long start = vb_now_us();
+    double anchor = (double)start;
+    long long k = 0;
+    int gap_done = 0, in_gap = 0;
+    unsigned rng = 12345;
+
+    (void)unused;
+    while (hs && *hs && nsched < 8) {
+        double hz = atof(hs), t;
+        const char *at = strchr(hs, '@'), *comma = strchr(hs, ',');
+        if (!at || hz <= 0)
+            break;
+        t = atof(at + 1);
+        sched_hz[nsched] = hz;
+        sched_t[nsched++] = t;
+        if (!comma)
+            break;
+        hs = comma + 1;
+    }
+    fprintf(stderr, "[vblank-test] fake 60.00 Hz display, %.0f s gap at t=%.0f s, %d rate change(s)\n",
+            gap_s, gap_at, nsched);
+    fflush(stderr);
+    for (;;) {
+        double due = anchor + (double)k * per;
+        double rel;
+
+        while ((double)vb_now_us() < due + 400.0)
+            Sleep(1);
+        rel = ((double)vb_now_us() - (double)start) / 1e6;
+        if (si < nsched && rel >= sched_t[si]) {
+            per = 1e6 / sched_hz[si];
+            anchor = due;
+            k = 0;
+            fprintf(stderr, "[vblank-test] link now %.2f Hz\n", sched_hz[si]);
+            fflush(stderr);
+            si++;
+        }
+        if (!gap_done && rel >= gap_at) {
+            if (!in_gap) {
+                in_gap = 1;
+                fprintf(stderr, "[vblank-test] gap begins\n");
+                fflush(stderr);
+            }
+            if (rel >= gap_at + gap_s) {
+                in_gap = 0;
+                gap_done = 1;
+                anchor = (double)vb_now_us() + 7000.0;   /* resume 7 ms out of phase */
+                k = 0;
+                fprintf(stderr, "[vblank-test] gap ends, phase shifted\n");
+                fflush(stderr);
+            }
+        }
+        if (!in_gap) {
+            double jit;
+            rng = rng * 1103515245u + 12345u;
+            jit = ((double)((rng >> 8) & 0xFFFF) / 65535.0 * 2.0 - 1.0) * 300.0;
+            kernel_vblank_link_sample((uint64_t)(due + jit));
+        }
+        k++;
+    }
+    return 0;
+}
+
 /* How long the timer thread may sleep before the next vblank is due. */
 static DWORD kernel_vblank_wait_ms(void)
 {
@@ -2919,15 +3545,17 @@ static void kernel_vblank_tick(void)
         return;
 
     now = vb_now_us();
+    lk_poll(now);                /* display samples, if a source pushes any */
     if (!s_vb_next_us)
         s_vb_next_us = now;
     if (now < s_vb_next_us)
         return;
     if (now - s_vb_next_us > VBLANK_PERIOD_US / 2)
-        s_vb_next_us = now + VBLANK_PERIOD_US;    /* far behind: restart here */
+        s_vb_next_us = now + lk_step(now);          /* far behind: restart here */
     else
-        s_vb_next_us += VBLANK_PERIOD_US;         /* on time: no drift */
+        s_vb_next_us += lk_step(s_vb_next_us);      /* on time: no drift */
     InterlockedIncrement(&s_vb_count);
+    lk_note_tick(now);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -3242,6 +3870,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     int slot = xbox_worker_stack_alloc();
 
     (void)unused;
+    xbox_thread_name("ktimer");
     xbox_guest_pin(1);             /* DPCs and vblank: interrupt-like, guest core */
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
@@ -3266,6 +3895,11 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             return 0;
         }
         g_fs_base = tib;
+    }
+    {
+        const char *t = getenv("RECOMP_VBLANK_LINK_TEST");
+        if (t && t[0] == '1')
+            CloseHandle(CreateThread(NULL, 0, lk_test_thread, NULL, 0, NULL));
     }
 
     for (;;) {
@@ -8560,7 +9194,9 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top, 0);
+                                                    start_context2, stack_top, 0,
+                                                    bridge_thread_name_va(start_routine,
+                                                                          start_context1));
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }

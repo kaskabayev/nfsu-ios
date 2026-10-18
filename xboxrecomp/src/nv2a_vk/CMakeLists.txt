@@ -31,8 +31,17 @@ else()
         # iOS: MoltenVK static lib + SDL2 static, supplied by the caller.
         find_package(SDL2 REQUIRED)
         target_include_directories(xbox_nv2a_vk PUBLIC "${VULKAN_HEADERS_DIR}")
-        target_link_libraries(xbox_nv2a_vk PUBLIC SDL2::SDL2-static
-            SPIRV-Tools-opt SPIRV-Tools c++)
+        find_library(SPIRV_TOOLS_LIB SPIRV-Tools PATHS "$ENV{HOME}/ios-deps/lib" NO_CMAKE_FIND_ROOT_PATH)
+        find_library(SPIRV_TOOLS_OPT_LIB SPIRV-Tools-opt PATHS "$ENV{HOME}/ios-deps/lib" NO_CMAKE_FIND_ROOT_PATH)
+        target_link_libraries(xbox_nv2a_vk PUBLIC
+            SDL2::SDL2
+            "${SPIRV_TOOLS_OPT_LIB}" "${SPIRV_TOOLS_LIB}" c++)
+        # MoltenVK ships as an embedded framework; the app bundles it.
+        set(MOLTENVK_FRAMEWORK "" CACHE PATH "MoltenVK.framework for iOS")
+        if(MOLTENVK_FRAMEWORK)
+            target_link_libraries(xbox_nv2a_vk PUBLIC "${MOLTENVK_FRAMEWORK}")
+            target_link_options(xbox_nv2a_vk PUBLIC -Wl,-rpath,@executable_path/Frameworks)
+        endif()
     else()
     find_package(Vulkan REQUIRED)
     find_package(PkgConfig REQUIRED)

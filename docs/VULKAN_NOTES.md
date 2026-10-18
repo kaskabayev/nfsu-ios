@@ -4,7 +4,7 @@
 
 - `xboxrecomp/src/nv2a_vk/nv2a_vk.c`, built with `NFSU2_VULKAN=ON`
   (`VULKAN=1 bash switch/build.sh` -> `switch/nfsu2x/nfsu2x-vulkan.nro`).
-  Setup, driver build and debugging switches: CLAUDE.md, "Vulkan build".
+  Setup, driver build and debugging switches: dev-notes-nfsu2.md, "Vulkan build".
 - Runs on the console (first hardware run 2026-09-29): race fps about the
   same as the GL build. Expected: the GL build was already limited by the
   game's main thread and the executor, not by the GL calls alone, and this
@@ -19,7 +19,7 @@
    pipeline binds per frame, pass restarts (begin_rendering), barriers, ring
    MB per frame, texture uploads, and executor CPU per draw. Profile a race
    with `RECOMP_NX_PROFILE=1` and the matching ELF
-   (`/root/nfsu2x/elf_archive/nfsu2x-vulkan_<md5>.elf`) to see how the
+   (`$WORK/elf_archive/nfsu2x-vulkan_<md5>.elf`) to see how the
    executor thread splits between decode, our recording and NVK.
 2. **A render thread** (like `RECOMP_GL_THREAD`). The GL queue (q_* in
    nv2a_gl.c) already copies everything a draw needs; move it into a shared

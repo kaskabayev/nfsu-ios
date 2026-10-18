@@ -6,15 +6,20 @@
 #   tools/build_ffmpeg_vp6.sh switch|linux
 #
 # Environment:
-#   FFMPEG_SRC   FFmpeg source (default /root/nfsu2x/ref/ffmpeg-7.1,
-#                git clone -b release/7.1 https://github.com/FFmpeg/FFmpeg.git)
-#   PREFIX       install prefix (default /root/nfsu2x/ffmpeg-vp6-<target>)
+#   FFMPEG_SRC   FFmpeg source (required):
+#                git clone -b release/7.1 https://github.com/FFmpeg/FFmpeg.git
+#   PREFIX       install prefix (default <repo>/build-ffmpeg-vp6-<target>)
 #   DEVKITPRO    default /opt/devkitpro
 set -euo pipefail
 
 TARGET="${1:-switch}"
-SRC="${FFMPEG_SRC:-/root/nfsu2x/ref/ffmpeg-7.1}"
-PREFIX="${PREFIX:-/root/nfsu2x/ffmpeg-vp6-$TARGET}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC="${FFMPEG_SRC:-}"
+if [ -z "$SRC" ] || [ ! -x "$SRC/configure" ]; then
+    echo "error: set FFMPEG_SRC to an FFmpeg checkout (git clone -b release/7.1 https://github.com/FFmpeg/FFmpeg.git)" >&2
+    exit 1
+fi
+PREFIX="${PREFIX:-$REPO/build-ffmpeg-vp6-$TARGET}"
 BUILD="$PREFIX-build"
 DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
 

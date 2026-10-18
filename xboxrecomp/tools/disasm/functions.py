@@ -68,8 +68,11 @@ class FunctionDetector:
     """
 
     def __init__(self, engine: DisasmEngine, image: BinaryImage,
-                 xrefs: XRefTracker, labels: LabelManager):
+                 xrefs: XRefTracker, labels: LabelManager,
+                 skip_library_immediates: bool = False):
         self.engine = engine
+        # Off by default. See _pass_imm_ref_targets.
+        self.skip_library_immediates = skip_library_immediates
         self.image = image
         self.xrefs = xrefs
         self.labels = labels
@@ -546,12 +549,30 @@ class FunctionDetector:
         def in_code_section(addr: int) -> bool:
             return any(lo <= addr < hi for lo, hi in code_ranges)
 
+        # Optional (skip_library_immediates): an immediate that sits in a
+        # *library* section (D3D, DSOUND, XPP, ...) never names a function of
+        # the title's own .text. Library to library references stay: DSOUND
+        # stores a DOLBY function pointer at 0x1EAB5B. The XDK's D3D code is
+        # full of NV2A register constants that happen to equal .text addresses
+        # (NFSU1: 0x100A20, 0x100A50, 0x118700, 0xC181C, 0x1C527C). Each was
+        # promoted to a function start, which cut NFSU1's sub_001009C0 (a jump
+        # table switch) in three and left its 0x100A48 tail unreachable.
+        def section_name(addr: int) -> str:
+            for sec in sections:
+                if sec.virtual_addr <= addr < sec.virtual_addr + sec.virtual_size:
+                    return sec.name
+            return ""
+
         targets = set()
         for insn in self.engine.instructions.values():
             target = insn.imm_ref
             if target is None or target in self.functions:
                 continue
             if inside_a_function(target) or not in_code_section(target):
+                continue
+            if (self.skip_library_immediates
+                    and section_name(target) == ".text"
+                    and section_name(insn.address) != ".text"):
                 continue
             targets.add(target)
 

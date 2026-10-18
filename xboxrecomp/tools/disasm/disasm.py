@@ -38,7 +38,8 @@ class Disassembler:
                  verbose: bool = False,
                  force: bool = False,
                  extra_sections: Optional[list] = None,
-                 seed_functions: Optional[list] = None):
+                 seed_functions: Optional[list] = None,
+                 skip_library_immediates: bool = False):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -48,6 +49,7 @@ class Disassembler:
         self.force = force
         self.extra_sections = extra_sections or []
         self.seed_functions = seed_functions or []
+        self.skip_library_immediates = skip_library_immediates
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -72,7 +74,8 @@ class Disassembler:
             if json_path and cache.is_valid(self.xbe_path, json_path,
                                              self.text_only,
                                              self.extra_sections,
-                                             self.seed_functions):
+                                             self.seed_functions,
+                                             self.skip_library_immediates):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -158,7 +161,8 @@ class Disassembler:
         if self.verbose:
             print("\nPhase 5: Detecting functions...")
         self.func_detector = FunctionDetector(
-            self.engine, self.image, self.xrefs, self.labels)
+            self.engine, self.image, self.xrefs, self.labels,
+            skip_library_immediates=self.skip_library_immediates)
 
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
@@ -275,7 +279,8 @@ class Disassembler:
             json_path = self._find_analysis_json()
             if json_path:
                 cache.save(self.xbe_path, json_path, self.text_only, elapsed,
-                           self.extra_sections, self.seed_functions)
+                           self.extra_sections, self.seed_functions,
+                           self.skip_library_immediates)
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")
