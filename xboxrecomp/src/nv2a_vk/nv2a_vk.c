@@ -3002,10 +3002,12 @@ static uint32_t s_ios_suboptimal, s_ios_rebuilds;
 /* Present timing (VK_GOOGLE_display_timing, MoltenVK) and pacing. Executor
  * thread only. Every present carries a presentID; MoltenVK reports when it
  * was shown (the same clock as clock_gettime_nsec_np(CLOCK_UPTIME_RAW)), also
- * when no time was asked for. RECOMP_VK_PACE=1 (default) asks for a time:
- * the next vsync of the display grid that keeps the game's own cadence. =0
- * only measures. The grid is 60 Hz: the app is capped at 60 on iPhone, and
- * a slot of the 60 Hz grid is also a slot on a 120 Hz display. */
+ * when no time was asked for. RECOMP_VK_PACE=1 asks for a time: the next
+ * vsync of the display grid that keeps the game's own cadence. 0 (default)
+ * only measures: on device every race frame was already shown for exactly
+ * 2 refreshes, and pacing only added latency. The grid is 60 Hz: the app is
+ * capped at 60 on iPhone, and a slot of the 60 Hz grid is also a slot on a
+ * 120 Hz display. */
 #define PC_V        16666667ull         /* one refresh, ns */
 #define PC_RING     64                  /* presents remembered, by presentID */
 #define PC_HIST     8                   /* flip intervals and phase samples kept */
@@ -3276,7 +3278,7 @@ static void pace_init(void)
     VkRefreshCycleDurationGOOGLE rc = { 0 };
     double ms;
     const char *e = getenv("RECOMP_VK_PACE");
-    s_pace.on = e && *e ? *e != '0' : 1;
+    s_pace.on = e && *e ? *e != '0' : 0;
     e = getenv("RECOMP_VK_PACE_MS");
     ms = e && *e ? strtod(e, NULL) : 12.0;
     if (!(ms >= 0.0 && ms <= 50.0))

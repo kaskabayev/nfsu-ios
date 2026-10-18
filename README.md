@@ -264,7 +264,7 @@ Main keys (the key names start with `NFSU2_` or `RECOMP_` for both games):
 | `RECOMP_GL_SCALE` | 0.5 to 4 (iOS default 2) | Render resolution, as a multiple of the original 640x480. |
 | `RECOMP_WIDESCREEN` | 1 or 0 | NFSU2: 16:9 (default 1). NFSU1: leave it 0; it only stretches the 4:3 picture. |
 | `RECOMP_PRESENT_INTERVAL` | 1 or 0 (iOS default 1) | 1 = races at 60 fps. 0 = the game's own 30 fps. |
-| `RECOMP_VK_PACE` | 1 or 0 (iOS default 1; NFSU1 0) | 1 = show each frame at the screen refresh that keeps the game's rate. 0 = only measure. The `[pace]` line in the log (every 10 s) counts the refreshes each frame stayed on screen: `2v` is two refreshes (30 fps). Many frames in `3v`, `4+v` or `late` mean uneven motion. |
+| `RECOMP_VK_PACE` | 0 or 1 (iOS default 0) | 1 = show each frame at the screen refresh that keeps the game's rate. 0 = only measure (the default: measured on device, pacing gave no gain and added delay; kept for A/B). The `[pace]` line in the log (every 10 s) counts the refreshes each frame stayed on screen: `2v` is two refreshes (30 fps). Many frames in `3v`, `4+v` or `late` mean uneven motion. |
 | `RECOMP_VK_PACE_MS` | 0 to 50 (default 12) | The least time in ms between the game's frame and the refresh that shows it. More time means fewer `late` frames and more delay. At 60 fps keep it below 14. |
 | `NFSU2_GAMMA` | 0.5 to 2 | Brightness. |
 | `RECOMP_VK_MIPS` | 1 or 0 | Mipmaps. |
