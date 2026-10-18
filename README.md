@@ -24,13 +24,20 @@ in this tree.
   Microsoft**. "Need for Speed" and "Underground" are trademarks of
   Electronic Arts. "Xbox" is a trademark of Microsoft.
 - **You need your own copy of the game.** You must own an NTSC-U Xbox disc of
-  the game and make a disc image of it yourself.
-- **This repository has no game files and no game code.** There is no disc
-  image, no `default.xbe`, no lifted C and no IPA here.
-- The lifted C is the game's own code in another form. It belongs to
-  Electronic Arts. The lift script creates it on your machine from your own
-  `default.xbe`. Never commit it, upload it or share it. For the same reason
-  there are no ready-made IPA or NRO files: they would contain that code.
+  the game and make a disc image of it yourself. The app reads everything it
+  needs from that image.
+- **This repository has no game files and no lifted C.** There is no disc
+  image, no `default.xbe` and no lifted C here. They never go into the
+  repository.
+- **The IPAs on the [Releases](https://github.com/kaskabayev/nfsu-ios/releases) page contain the game's program
+  code**, translated ahead of time from x86 to C and compiled into the app.
+  They contain **none of the game's assets**: no textures, models, sounds,
+  music, videos, text or tracks. The app does not download anything. The
+  program code belongs to Electronic Arts, as the rest of the game does. Use
+  the IPA only if you own the game.
+- The lift script can create the same code on your machine from your own
+  `default.xbe`. You can build the IPA yourself (see "Build from source"). There
+  are no ready-made NRO files for the Switch.
 
 ## Features
 
@@ -75,9 +82,17 @@ stops you from building NFSU1 with the lifted code of NFSU2 (or the reverse).
 
 ## Install on iPhone or iPad
 
-No IPA is distributed. You build it yourself from your own disc (see
-"Build from source"). Then you install the unsigned IPA with a sideloading
-tool.
+Get an IPA in one of two ways:
+
+- Download it from the [Releases](https://github.com/kaskabayev/nfsu-ios/releases) page: `NFSU2-<tag>_<sha>.ipa`
+  or `NFSU1-<tag>_<sha>.ipa`. The public IPAs use the bundle IDs
+  `io.github.kaskabayev.nfsu2` and `io.github.kaskabayev.nfsu1`. The IPA holds
+  the game's translated program code but no assets, so you still need your own
+  NTSC-U disc image (see "Read this first").
+- Build it yourself from your own disc (see "Build from source").
+
+The IPA is unsigned. Install it with a sideloading tool, which signs it when
+it installs it.
 
 1. Install [SideStore](https://sidestore.io) or
    [LiveContainer](https://github.com/LiveContainer/LiveContainer). A free
@@ -195,7 +210,10 @@ cmake -S . -B build-ios -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 
 The libraries it needs: SDL 2.30.9 (static), glslang 15.1.0 with SPIRV-Tools,
 Vulkan-Headers 1.3.296 and the MoltenVK 1.4.2 framework. Then wrap
 `build-ios/nfsu2_recomp.app` into an unsigned IPA, with the icons from
-`games/nfsu2/ios/`. Sideloading tools sign it when they install it.
+`games/nfsu2/ios/`. Sideloading tools sign it when they install it. If you
+give the IPA to other people, put the licence texts into the app too: copy
+`licenses/` to `<app>/Licenses/` and run
+`tools/make_notices.sh <app>/THIRD-PARTY-NOTICES.txt <commit>`.
 
 If you have no Mac, build on GitHub Actions. See the next section.
 The file `.github/workflows/ios-feasibility.yml` only builds the runtime
@@ -203,9 +221,52 @@ libraries for iOS. It needs no game files.
 
 ### Build the IPA on GitHub Actions
 
-The workflow `build-ipa` lifts your own `default.xbe` on a Linux runner. Then
-it builds the app on a macOS runner and gives you an unsigned IPA. You need a
-**private** repository, because the lifted C is the game's code.
+The workflow `build-ipa` lifts your own `default.xbe` and builds an unsigned
+IPA. It never takes the game file from this repository: you give it a source
+for `default.xbe` and it checks the SHA-256 against
+`games/<game>/game_profile.h`. It stops if they differ. Use one of two paths.
+
+#### Fork (public, free minutes) (not yet tested end to end)
+
+1. Fork this repository on GitHub.
+2. Open the Actions tab of your fork and enable the workflows. GitHub turns
+   them off in a new fork.
+3. Take `default.xbe` out of your disc image (see "Get the tools" above,
+   `tools.xiso get`). Host it where only you can reach it, at a direct
+   `https://` download URL. Two ways:
+   - a private link of your own storage (for example a signed URL with a long
+     expiry);
+   - a release asset in a **private** repository, plus a fine-grained token
+     with read-only access to that repository. Put the token in the secret
+     `XBE_TOKEN` (step 4). The URL is the asset API URL
+     `https://api.github.com/repos/<owner>/<repo>/releases/assets/<id>`. Get
+     the id with `gh api repos/<owner>/<repo>/releases/tags/<tag> --jq '.assets[] | {name, id}'`.
+4. In your fork, open Settings > Secrets and variables > Actions. Add the
+   secret `XBE_URL_NFSU2` (or `XBE_URL_NFSU1`) with that URL. Add `XBE_TOKEN`
+   only if you use the token. Send the token only with a GitHub asset URL: other
+   hosts may refuse the header.
+5. Open Actions > build-ipa > Run workflow and pick the game. When the run is
+   done, download the IPA artifact and install it as described in "Install on
+   iPhone or iPad".
+
+Things to know:
+
+- In a public repository the game file must come from the secret. The workflow
+  refuses a release asset, with an error: a release in a public repository
+  publishes the game's executable. Never put `default.xbe` into a release or
+  commit it.
+- One macOS job lifts the game and builds the app. The lifted C is not
+  uploaded and not cached. macOS minutes are free for public repositories.
+  The workflow has no ccache cache in a public repository, so every run
+  compiles the app from scratch. (Run time in a fork is not measured yet.)
+- The log of a public repository is public. The workflow writes the output of
+  the lifter to a file and prints only the stage lines. It never prints the URL
+  or the token.
+- The IPA artifact of a public fork can be downloaded by other GitHub users.
+  It holds the game's program code. Delete the run if you do not want that. The
+  IPA is kept for 3 days.
+
+#### Private copy (as before; uses your Actions minutes)
 
 1. Make a private repository. A fork of a public repository cannot be
    private, so create a new private repository on GitHub. Then run:
@@ -217,30 +278,45 @@ it builds the app on a macOS runner and gives you an unsigned IPA. You need a
 2. Take `default.xbe` out of your disc image (see "Get the tools" above,
    `tools.xiso get`). Rename it to `nfsu2.xbe` or `nfsu1.xbe`.
 3. In the private repository, create a release with the tag `xbe`. Attach the
-   file. (A release of a private repository is private.)
+   file. (A release of a private repository is private.) Instead of the
+   release you can set the secret `XBE_URL_NFSU2` / `XBE_URL_NFSU1` as in the
+   fork path. If the secret is set, the workflow uses it.
 4. Open Actions > build-ipa > Run workflow. Pick the game. Download the IPA
    artifact when the run is done. Install it as described in "Install on
    iPhone or iPad".
 
 Notes:
 
-- The lift runs on Linux and takes about 4 minutes. The iOS build runs on
-  macOS. It takes about 4 minutes the first time, and about 1 minute later,
-  when the libraries come from the cache.
+- A Linux job lifts the game (about 4 minutes). A macOS job builds the app. It
+  takes about 4 minutes the first time, and about 1 minute later, when the
+  libraries and the compiled code come from the cache.
 - A private repository uses the Actions minutes of your account. One macOS
   minute counts as 10 minutes. So the first build uses about 45 minutes of
   your quota, and a later build about 15. (Measured on GitHub-hosted runners
   in October 2026. The free plan gives 2000 minutes per month.)
-- The workflow compares the SHA-256 of your XBE with the value in
-  `games/<game>/game_profile.h`. It stops if they differ.
-- The workflow refuses to run in a public repository. The lifted code and the
-  IPA hold the game's code. In a public repository, everyone could download
-  them.
 - The lifted code is kept as an artifact for 1 day. The IPA is kept for 3
-  days.
-- Optional inputs: `xbe_release` (another release tag) and `bundle_id`
-  (default `io.github.<owner>.<game>`).
-- Never upload the lifted code, the IPA or the XBE to a public place.
+  days. Only people with read access to the private repository can download
+  them.
+- Never upload the lifted code or the XBE to a public place.
+
+#### Options (both paths)
+
+- `bundle_id`: the bundle ID of the app (default `io.github.<owner>.<game>`).
+- `xbe_release`: private repository only, when no URL secret is set. The tag of
+  the release that holds `<game>.xbe` (default `xbe`).
+- `icons_release`: your own icons. Make a release in the same repository (for
+  example `icons`) and attach `nfsu2-icons.tar.gz` (or `nfsu1-icons.tar.gz`).
+  The archive has the layout of `games/<game>/ios/`: the folder
+  `Assets.xcassets/` (with `AppIcon.appiconset/`) and the folder `icon/` with
+  the loose PNG files. Pack it like this:
+  ```sh
+  tar -czf nfsu2-icons.tar.gz -C games/nfsu2/ios Assets.xcassets icon
+  ```
+  Then pass the tag in `icons_release`. The workflow stops with an error if the
+  layout is wrong. Empty = the icons in `games/<game>/ios/`.
+- The app contains the licence texts of its third-party code
+  (`Licenses/` and `THIRD-PARTY-NOTICES.txt` inside the app). The workflow also
+  uploads `THIRD-PARTY-NOTICES.txt` as the artifact `notices`.
 
 ### 3c. Build for Nintendo Switch
 
@@ -330,7 +406,8 @@ which device and which iOS version you use. Do not attach game files.
 | `games/nfsu2/`, `games/nfsu1/` | per-game code: manual overrides, state reader, game profile, lifter config, icons |
 | `src/` | shared startup code, iOS launch screen, movie decoder, Switch layer |
 | `xboxrecomp/` | the toolkit: lifter, runtime, renderers, with this project's changes |
-| `tools/` | `lift.sh` (lift a game), `make_art.py` (draws the icons), tests |
+| `tools/` | `lift.sh` (lift a game), `ci_lift.sh` (the lift step of the CI workflow), `make_notices.sh` (joins the licence texts), `make_art.py` (draws the icons), tests |
+| `licenses/` | licence texts of the third-party code in the iOS app, with an index |
 | `.github/` | issue template and workflows: `build-ipa.yml` (IPA from your own game file), `ios-feasibility.yml` (runtime libraries only) |
 | `switch/` | Switch build script |
 | `docs/` | developer notes, performance notes, Switch notes, settings reference |
@@ -355,4 +432,9 @@ Licence facts:
   extent the fork's author can license them. Edits inside upstream files
   cannot be licensed apart from the upstream code. See
   [LICENSE-NOTES.md](LICENSE-NOTES.md).
-- The game belongs to Electronic Arts. This project has no rights to it.
+- The licences of the third-party code inside the iOS app (SDL, glslang,
+  SPIRV-Tools, MoltenVK and others) are in [licenses/](licenses/README.md).
+  The IPA carries them in `Licenses/` and `THIRD-PARTY-NOTICES.txt`.
+- The game belongs to Electronic Arts. This project has no rights to it. The
+  released IPAs contain the game's program code but none of its assets; see
+  [LICENSE-NOTES.md](LICENSE-NOTES.md).

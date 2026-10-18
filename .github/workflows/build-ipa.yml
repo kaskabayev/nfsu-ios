@@ -1,15 +1,25 @@
 # Build the iOS IPA of NFSU2 or NFSU1 from your own game file.
 #
-# Run this in a PRIVATE copy of the repository only. The lifted C is the
-# game's code in another form, and it must never be public. Both jobs stop
-# when the repository is public. See "Build the IPA on GitHub Actions" in
-# README.md.
+# The lifted C is the game's code in another form. It must never become a
+# public file. So the workflow has two layouts, chosen by the visibility of
+# the repository it runs in:
 #
-# Job "lift" (Linux): takes <game>.xbe from a release of this repository,
-# checks its SHA-256, lifts it to C and passes the C to the next job as a
-# short-lived artifact.
-# Job "ipa" (macOS): builds the app from this commit and the lifted C, and
-# packs an unsigned IPA.
+#   PRIVATE repository
+#     Job "lift" (Linux) lifts the game and passes the C to the job "ipa" as an
+#     artifact with 1 day retention. Job "ipa" (macOS) builds the app.
+#     The game file (default.xbe) comes from the secret XBE_URL_<GAME> if it
+#     is set, else from the asset <game>.xbe of the release `xbe_release`.
+#
+#   PUBLIC repository (a fork)
+#     One macOS job lifts and builds. The lifted C is never uploaded, and it is
+#     not cached. macOS minutes are free in public repositories. The game file
+#     comes only from the secret XBE_URL_<GAME>. A release asset is refused: a
+#     release in a public repository would publish the game's executable.
+#
+# Secrets: XBE_URL_NFSU2, XBE_URL_NFSU1 (direct https download URL of the
+# game's default.xbe), XBE_TOKEN (optional, see tools/ci_lift.sh).
+# The shared logic is in tools/ci_lift.sh. See "Build the IPA on GitHub
+# Actions" in README.md.
 name: build-ipa
 
 on:
@@ -23,7 +33,7 @@ on:
           - nfsu1
         default: nfsu2
       xbe_release:
-        description: Release tag (in this repository) that holds <game>.xbe
+        description: Private repository only, if the secret XBE_URL_<GAME> is empty. Release tag (in this repository) that holds <game>.xbe
         type: string
         default: xbe
       bundle_id:
@@ -31,35 +41,24 @@ on:
         type: string
         required: false
         default: ''
+      icons_release:
+        description: Optional. Release tag (in this repository) that holds <game>-icons.tar.gz with your own icons (empty = the icons in games/<game>/ios)
+        type: string
+        required: false
+        default: ''
 
 jobs:
+  # Private repositories only. In a public repository this job is skipped and
+  # the job "ipa" lifts the game itself.
   lift:
+    if: ${{ github.event.repository.private }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
       contents: read
     env:
       GAME: ${{ inputs.game }}
-      XBE_RELEASE: ${{ inputs.xbe_release }}
     steps:
-      - name: Require a private repository
-        env:
-          IS_PRIVATE: ${{ github.event.repository.private }}
-        run: |
-          if [ "$IS_PRIVATE" != "true" ]; then
-            echo "::error::Run this only in a private repository: the lifted code is the game's code and must not be public."
-            exit 1
-          fi
-          case "$GAME" in
-            nfsu2|nfsu1) ;;
-            *) echo "::error::Unknown game: $GAME"; exit 1 ;;
-          esac
-          case "$XBE_RELEASE" in
-            ''|-*|*[!A-Za-z0-9._/-]*)
-              echo "::error::xbe_release must be a release tag: letters, digits, dot, underscore, slash and hyphen only, no leading hyphen."
-              exit 1 ;;
-          esac
-
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -73,59 +72,15 @@ jobs:
       - name: Python packages
         run: python -m pip install capstone==5.0.9
 
-      - name: Get the game file from the release
+      - name: Get the game file, check it, lift it
         env:
+          IS_PRIVATE: 'true'
+          XBE_RELEASE: ${{ inputs.xbe_release }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/xbe"
-          if ! gh release download "$XBE_RELEASE" -R "$GITHUB_REPOSITORY" \
-                 -p "$GAME.xbe" -O "$RUNNER_TEMP/xbe/default.xbe" --clobber; then
-            echo "::error::Cannot download $GAME.xbe from release '$XBE_RELEASE' of this repository. Create the release and attach the file."
-            exit 1
-          fi
-          test -s "$RUNNER_TEMP/xbe/default.xbe"
-
-      - name: Check the game file
-        run: |
-          P="games/$GAME/game_profile.h"
-          WANT="$(grep -A1 'define NFSU_XBE_SHA256' "$P" | grep -oE '"[0-9a-f]{64}"' | tr -d '"')"
-          TID="$(grep -oE 'NFSU_XBE_TITLE_ID +0x[0-9A-Fa-f]+' "$P" | awk '{print $2}')"
-          if [ "${#WANT}" -ne 64 ] || [ -z "$TID" ]; then
-            echo "::error::Cannot read NFSU_XBE_SHA256 or NFSU_XBE_TITLE_ID from $P."
-            exit 1
-          fi
-          HAVE="$(sha256sum "$RUNNER_TEMP/xbe/default.xbe" | cut -d' ' -f1)"
-          echo "expected sha256: $WANT"
-          echo "found sha256:    $HAVE"
-          if [ "$HAVE" != "$WANT" ]; then
-            echo "::error::$GAME.xbe is not the expected file. This build needs default.xbe of the NTSC-U disc of $GAME (title ID $TID, SHA-256 $WANT). The file in release '$XBE_RELEASE' has SHA-256 $HAVE."
-            exit 1
-          fi
-
-      - name: Lift the game
-        run: |
-          T0=$(date +%s)
-          XBE="$RUNNER_TEMP/xbe/default.xbe" GEN=gen tools/lift.sh "$GAME"
-          SECS=$(( $(date +%s) - T0 ))
-          echo "Lift time: $SECS s"
-          echo "LIFT_SECS=$SECS" >> "$GITHUB_ENV"
-          test -f gen/recomp_funcs.h
-
-      - name: Manifest of the lifted files (hashes only)
-        run: |
-          (cd gen && find . -type f ! -name xbe_analysis.json -printf '%P\n' \
-             | LC_ALL=C sort | xargs -d '\n' sha256sum) > gen.manifest
-          LINES="$(wc -l < gen.manifest)"
-          SUM="$(sha256sum gen.manifest | cut -d' ' -f1)"
-          {
-            echo "### Lift: $GAME"
-            echo
-            echo "- Lift time: $LIFT_SECS s"
-            echo "- Files in the manifest: $LINES"
-            echo "- SHA-256 of the manifest: \`$SUM\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "manifest lines: $LINES"
-          echo "manifest sha256: $SUM"
+          XBE_URL_NFSU2: ${{ secrets.XBE_URL_NFSU2 }}
+          XBE_URL_NFSU1: ${{ secrets.XBE_URL_NFSU1 }}
+          XBE_TOKEN: ${{ secrets.XBE_TOKEN }}
+        run: tools/ci_lift.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -148,8 +103,12 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+  # Both layouts. Private repository: builds from the lifted C of the job
+  # "lift". Public repository: the job "lift" is skipped and this job lifts the
+  # game itself (the lifted C stays on this runner).
   ipa:
     needs: lift
+    if: ${{ !cancelled() && (needs.lift.result == 'success' || (needs.lift.result == 'skipped' && !github.event.repository.private)) }}
     runs-on: macos-14
     timeout-minutes: 300
     permissions:
@@ -158,15 +117,6 @@ jobs:
       GAME: ${{ inputs.game }}
       GAME_UP: ${{ inputs.game == 'nfsu2' && 'NFSU2' || 'NFSU1' }}
     steps:
-      - name: Require a private repository
-        env:
-          IS_PRIVATE: ${{ github.event.repository.private }}
-        run: |
-          if [ "$IS_PRIVATE" != "true" ]; then
-            echo "::error::Run this only in a private repository: the lifted code is the game's code and must not be public."
-            exit 1
-          fi
-
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -188,18 +138,103 @@ jobs:
           echo "BUNDLE_ID=$BID" >> "$GITHUB_ENV"
           echo "Bundle ID: $BID"
 
+      - name: Icon source
+        env:
+          ICONS_RELEASE: ${{ inputs.icons_release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ICONSRC="games/$GAME/ios"
+          if [ -n "$ICONS_RELEASE" ]; then
+            case "$ICONS_RELEASE" in
+              -*|*[!A-Za-z0-9._/-]*)
+                echo "::error::icons_release must be a release tag: letters, digits, dot, underscore, slash and hyphen only, no leading hyphen."
+                exit 1 ;;
+            esac
+            TGZ="$RUNNER_TEMP/$GAME-icons.tar.gz"
+            if ! gh release download "$ICONS_RELEASE" -R "$GITHUB_REPOSITORY" \
+                   -p "$GAME-icons.tar.gz" -O "$TGZ" --clobber; then
+              echo "::error::Cannot download $GAME-icons.tar.gz from release '$ICONS_RELEASE' of this repository."
+              exit 1
+            fi
+            # Only plain files and folders, no absolute path, no '..'.
+            if tar -tzf "$TGZ" | grep -E '(^/|(^|/)\.\.(/|$))' >/dev/null; then
+              echo "::error::$GAME-icons.tar.gz holds an absolute path or a '..' path."
+              exit 1
+            fi
+            if tar -tzvf "$TGZ" | grep -v -E '^[-d]' >/dev/null; then
+              echo "::error::$GAME-icons.tar.gz must hold only plain files and folders (no links)."
+              exit 1
+            fi
+            ICONSRC="$RUNNER_TEMP/icons-$GAME"
+            rm -rf "$ICONSRC"
+            mkdir -p "$ICONSRC"
+            tar -xzf "$TGZ" -C "$ICONSRC"
+            if [ ! -f "$ICONSRC/Assets.xcassets/AppIcon.appiconset/Contents.json" ]; then
+              echo "::error::$GAME-icons.tar.gz has the wrong layout: Assets.xcassets/AppIcon.appiconset/Contents.json is missing. Pack it like this: tar -czf $GAME-icons.tar.gz -C games/$GAME/ios Assets.xcassets icon"
+              exit 1
+            fi
+            if ! ls "$ICONSRC"/icon/*.png >/dev/null 2>&1; then
+              echo "::error::$GAME-icons.tar.gz has the wrong layout: icon/*.png is missing. Pack it like this: tar -czf $GAME-icons.tar.gz -C games/$GAME/ios Assets.xcassets icon"
+              exit 1
+            fi
+            echo "Icons: from release '$ICONS_RELEASE'"
+          else
+            echo "Icons: games/$GAME/ios"
+          fi
+          echo "ICONSRC=$ICONSRC" >> "$GITHUB_ENV"
+
+      - name: Tools
+        run: |
+          brew install cmake ninja pkg-config python3 ccache
+          {
+            echo "CCACHE_DIR=$HOME/Library/Caches/ccache"
+            echo "CCACHE_MAXSIZE=3G"
+            echo "CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+          } >> "$GITHUB_ENV"
+
+      # Private repository: the lifted C comes from the job "lift".
       - uses: actions/download-artifact@v4
+        if: ${{ github.event.repository.private }}
         with:
           name: gen-${{ inputs.game }}
           path: ${{ runner.temp }}/gen-art
 
       - name: Unpack the lifted code
+        if: ${{ github.event.repository.private }}
         run: |
           command -v zstd >/dev/null || brew install zstd
           mkdir -p gen
           zstd -d -c "$RUNNER_TEMP/gen-art/gen-$GAME.tar.zst" | tar -xf - -C gen
           test -f gen/recomp_funcs.h
           echo "files in gen: $(find gen -type f | wc -l | tr -d ' ')"
+
+      # Public repository: lift here. The lifted C stays on this runner. It is
+      # not uploaded and not cached.
+      - uses: actions/setup-python@v5
+        if: ${{ !github.event.repository.private }}
+        with:
+          python-version: '3.12'
+
+      - name: Python packages
+        if: ${{ !github.event.repository.private }}
+        run: python -m pip install capstone==5.0.9
+
+      - name: Get the game file, check it, lift it
+        if: ${{ !github.event.repository.private }}
+        env:
+          IS_PRIVATE: 'false'
+          XBE_URL_NFSU2: ${{ secrets.XBE_URL_NFSU2 }}
+          XBE_URL_NFSU1: ${{ secrets.XBE_URL_NFSU1 }}
+          XBE_TOKEN: ${{ secrets.XBE_TOKEN }}
+        run: tools/ci_lift.sh
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !github.event.repository.private }}
+        with:
+          name: gen-manifest-${{ inputs.game }}
+          path: gen.manifest
+          retention-days: 7
 
       - name: Fail-fast syntax check (ObjC + main.c, no SDL)
         run: |
@@ -235,16 +270,6 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
-
-      - name: Tools
-        run: |
-          brew install cmake ninja pkg-config python3 ccache
-          {
-            echo "CCACHE_DIR=$HOME/Library/Caches/ccache"
-            echo "CCACHE_MAXSIZE=3G"
-            echo "CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime"
-            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
-          } >> "$GITHUB_ENV"
 
       - name: Cache ios-deps (SDL2 + glslang)
         id: cache-deps
@@ -324,9 +349,13 @@ jobs:
 
       # restore + an explicit save below: actions/cache@v4 saves only when the
       # job succeeds, and a failed build should still keep its compiled gen.
-      # The cache holds object files of the lifted code: it stays inside this
-      # private repository.
+      # The cache holds object files of the lifted code. Only in a private
+      # repository. In a public repository there is no ccache cache: workflows
+      # of forks can read caches of the default branch, and the objects are
+      # the game's code. macOS minutes are free there, so the app compiles
+      # from scratch.
       - name: Restore ccache
+        if: ${{ github.event.repository.private }}
         uses: actions/cache/restore@v4
         with:
           path: ~/Library/Caches/ccache
@@ -385,7 +414,7 @@ jobs:
         run: ccache -s
 
       - name: Save ccache
-        if: always()
+        if: ${{ always() && github.event.repository.private }}
         uses: actions/cache/save@v4
         with:
           path: ~/Library/Caches/ccache
@@ -397,6 +426,26 @@ jobs:
           name: ios-logs-${{ inputs.game }}
           path: "*.log"
           retention-days: 3
+
+      # The LGPL note names where the source of this build is. A public fork
+      # names itself. A private copy names the public project, because nobody
+      # else can open the private repository.
+      - name: Third-party notices
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ "$IS_PRIVATE" = "true" ]; then
+            tools/make_notices.sh "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt" "$GITHUB_SHA"
+          else
+            tools/make_notices.sh "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt" "$GITHUB_SHA" \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notices
+          path: ${{ runner.temp }}/THIRD-PARTY-NOTICES.txt
+          retention-days: 7
 
       - name: Package IPA (unsigned, for SideStore)
         if: success()
@@ -442,7 +491,8 @@ jobs:
           # Info.plist. The loose PNGs always go into the app: LiveContainer
           # and sideload tools read them. A failed actool must not fail the
           # build: fall back to the loose PNGs with explicit icon keys.
-          ICONSRC="games/$GAME/ios"
+          # ICONSRC is set by the step "Icon source".
+          test -d "$ICONSRC/Assets.xcassets"
           if [ -d "$ICONSRC/icon" ]; then
             cp "$ICONSRC"/icon/*.png "$APP/"
           fi
@@ -489,6 +539,11 @@ jobs:
           echo "icon keys in Info.plist:"
           "$PB" -c 'Print :CFBundleIcons' "$PLIST" || true
           "$PB" -c 'Print :CFBundleIcons~ipad' "$PLIST" || true
+          # Licence texts and notices go into the app before it is signed.
+          rm -rf "$APP/Licenses"
+          mkdir -p "$APP/Licenses"
+          cp -R licenses/. "$APP/Licenses/"
+          cp "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt" "$APP/THIRD-PARTY-NOTICES.txt"
           mkdir -p "$APP/Frameworks"
           rm -rf "$APP/Frameworks/MoltenVK.framework"
           cp -R "$MVK_FW" "$APP/Frameworks/"
@@ -508,8 +563,9 @@ jobs:
           mv "$GAME_UP-unsigned.ipa" "$GAME_UP-${VER}.ipa"
           echo "IPA_NAME=$GAME_UP-${VER}.ipa" >> "$GITHUB_ENV"
 
-      # The IPA holds the game's code. Only people with read access to this
-      # private repository can download it.
+      # The IPA holds the game's code. In a private repository only people with
+      # read access can download it. In a public fork, other GitHub users can
+      # download it. Do not publish it as a release of a fork.
       - uses: actions/upload-artifact@v4
         if: success()
         with:

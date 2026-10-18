@@ -51,6 +51,8 @@ the xemu register-combiner behaviour (`d3d8_combiners.h`).
 ## Libraries used by the builds
 
 These are not in the repository. The builds link them or download them.
+The licence texts of the ones inside the iOS app are in
+[licenses/](licenses/README.md).
 
 | Name, version | Licence | Used for | Link |
 |---|---|---|---|

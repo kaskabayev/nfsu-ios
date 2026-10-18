@@ -31,13 +31,40 @@ The licence status of that code stays as the table above states.
 
 ## Game data and lifted code
 
-The game, its code and its data belong to Electronic Arts. This repository
-holds none of them and never must:
+The game, its code and its data belong to Electronic Arts. Two things must be
+told apart: this repository, and the released app.
+
+**This repository** holds none of the game's files and never must:
 
 - no disc image, no `default.xbe`, no game files;
 - no lifted C (the output of `tools/lift.sh`). It is the game's code in
   another form;
-- no IPA or NRO built from lifted C.
+- no IPA, NRO or other build made from lifted C.
 
-Each user makes the lifted C from their own copy of the game, on their own
-machine.
+`.gitignore` keeps these out. The rule against committing lifted C stays.
+
+**The released app** (the IPAs on the Releases page) contains the game's
+program code. The code was translated ahead of time from x86 to C and compiled
+into the app, as other static recompilation projects ship theirs (for example
+[bep1s69/nfsmw-ios](https://github.com/bep1s69/nfsmw-ios)). The app contains
+**none** of the game's assets: no textures, models, sounds, music, videos, text
+or tracks. It does not download anything. It reads the game's data from a disc
+image that the user provides.
+
+You must own the game. Use a disc image made from your own NTSC-U disc. Do not
+ask for, or share, disc images or game files in this project's issues.
+
+The program code in the released app belongs to Electronic Arts. This project
+has no rights to it and gives no licence for it.
+
+People can also build the IPA themselves from their own `default.xbe`, in a
+fork or in a private copy of the repository (see the README).
+
+## Third-party code in the released app
+
+The app contains code from other projects. Their licence texts are in
+[licenses/](licenses/README.md). The IPA carries them in `Licenses/` and in
+`THIRD-PARTY-NOTICES.txt`. The xemu files (LGPL-2.1-or-later) are linked
+statically. The full source and the build scripts of the app are in this
+repository, so users can rebuild and relink the app from their own
+`default.xbe`.
