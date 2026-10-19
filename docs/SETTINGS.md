@@ -55,6 +55,8 @@ RECOMP_WIDESCREEN=0
 | `NFSU2_ISO=<path>` | Use this disc image. `NFSU2_ISO=0` turns image reading off. |
 | `NFSU2_GL=0` | Use the executor's CPU renderer instead of the GPU renderer. |
 | `NFSU2_APU=0` | With `RECOMP_AC97_READY=plain`: no emulated APU (no sound). |
+| `NFSU2_DT_SMOOTH=0` | NFSU2: the game's own time step in races and menus. By default the step is a whole number of 1/60 s (1 at 60 fps, 2 at 30 fps; the median of the last 8 frames) and the difference to the real time is paid back one 1/60 s at a time when it grows past 1.5 steps. Cutscenes and load stalls keep the real step; resuming from the pause menu does not move the race forward. |
+| `RECOMP_LOAD_FAST=0` | NFSU2: no 60 fps loading screens. By default, with `RECOMP_PRESENT_INTERVAL=0`, the swap interval is every refresh while a load runs (8 of the last 10 frames queued a read job) and goes back to the game's own value 10 frames after the last job. The game reads one block per frame, so the load takes about half the time. Not while the heat cap is on or in cutscenes, and not past 30 s in one stretch. One `[load] <s> s, <frames> frames, <kicks> loader kicks, fast on|off` line per load. |
 | `NFSU2_SIM_STEPS` | Longest game-time step per frame, in 1/60 s (default 6 = 100 ms; 3 = the original 50 ms cap, which slows races below 20 fps). |
 | `NFSU2_NATIVE_VP6` | Movie decoder: 1 = FFmpeg (default when built with it), 0 = the lifted decoder, 2 = both and compare. |
 | `NFSU2_MOVIE_FLASH=1` | Keep the opening trailer's white flash frames (shown black by default). |
@@ -135,7 +137,7 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_PB_RUN=1\|0` | Take vertex-constant and index runs of the pushbuffer in one loop and skip the per-word survey. Default 1; 0 on iOS and in NFSU1. |
 | `RECOMP_VK_PACE=1\|0` | iOS, Vulkan: 1 = ask for each frame's present time (the next refresh on the 60 Hz grid that keeps the game's own rate), 0 (default) = only measure: the measurement showed no gain, pacing only added delay; kept for A/B. The `[pace]` line every 10 s counts frames by the refreshes they stayed on screen (`1v` .. `4+v`) and the `late` ones. |
 | `RECOMP_VK_PACE_MS=<ms>` | With `RECOMP_VK_PACE`: the least time between the game's frame and the refresh that shows it (default 12, 0..50). |
-| `RECOMP_DT_HIST=0` | NFSU2: no `[dt]` line. By default a `[dt]` line every 10 s gives the physics ticks the game ran per frame (min, max, average, the most common values); at 30 fps a steady 120 means even motion, a wide spread means the game's time step varies from frame to frame. |
+| `RECOMP_DT_HIST=0` | NFSU2: no `[dt]` line. By default a `[dt]` line every 10 s gives the physics ticks per frame (min, max, average, the most common values) twice: `raw` is what the real frame time asks for, `used` is what the game ran after `NFSU2_DT_SMOOTH`. It also gives `debt fixes` (how often the smoothing paid back a 1/60 s) and the largest debt in ms. At 30 fps a steady 120 means even motion, a wide spread means the step varies from frame to frame. |
 | `RECOMP_VK_DUMP_ALL=1` | With `RECOMP_GL_DUMP`: dump every surface too, as `<prefix><frame>_<va>.bmp`. |
 | `RECOMP_DRAW_MERGE_STATS=1` | With `RECOMP_DRAW_STATS=1`: also survey draws that match the previous one (hashes every index; slow). |
 | `RECOMP_VK_HEADLESS=1` | Vulkan on Linux: no window (also implied by `SDL_VIDEODRIVER=offscreen`). |

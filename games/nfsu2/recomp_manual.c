@@ -586,28 +586,225 @@ static void swap_pre(uint32_t slot)
     }
 }
 
+/* ── Smooth game time step (main-loop call of sub_001890C0) ──
+ *
+ * The game's dt comes from rdtsc, so it follows the real frame time. At 60
+ * fps the presents are even (the queue shows each frame for one refresh),
+ * but the game iterations are not: the [dt] line showed N = 7..11 followed
+ * by 105..117 in almost every window (average 60). The car moved two
+ * frames' worth, then almost nothing, and the display queue hid it from
+ * the fps counter.
+ *
+ * The hook takes the dt of the main-loop call (return address 0x0018A9F0;
+ * the call at 0x0018A735 has a fixed step and is left alone) and hands the
+ * game an even one instead. The dt is the float at [esp + 4], seconds,
+ * cdecl; the caller only pops it.
+ *   k     the median of real_dt / V over the last 8 iterations, rounded,
+ *         at least 1 (V = 1/60 s). 1 at 60 fps, 2 at a steady 30 fps.
+ *   base  k * V.
+ *   debt  the sum of real_dt - used_dt. One V is paid back only when the
+ *         debt would pass 1.5 V: one more V when behind, one less when
+ *         ahead (never under V). A late iteration followed by a quick one
+ *         (1.9 V, 0.1 V) comes out as V, V.
+ * The real dt goes through unchanged, with the debt and the median cleared,
+ * when it is above the game's step cap (at most 6 V: a load hitch, the app
+ * parked), when the game's floor (0x428EE8) is above 1/60 (cutscene:
+ * the NIS plays at 30 fps) or when the game runs its 50 Hz table (0x3A4C50 =
+ * 0). It also goes through, with the debt kept, while the median is under
+ * 0.75 V: frames much faster than 60 fps, where a step of V would run the
+ * game fast. A debt that cannot be paid (k = 1 and ahead, or the step at its
+ * cap) is cut to 1.5 V.
+ *
+ * NFSU2_DT_SMOOTH=0 hands the game its own dt as before. The pure step is
+ * between the markers; tools or tests may extract it. */
+/* DT_SMOOTH_BEGIN */
+#define DT_V        (1.0f / 60.0f)
+#define DT_SM_RING  8                   /* iterations the median looks at */
+#define DT_SM_HITCH 6.0f                /* longest smoothed dt, in V */
+#define DT_SM_FAST  0.75f               /* median under this (in V): no smoothing */
+
+typedef struct {
+    float ratio[DT_SM_RING];            /* real_dt / V of the last iterations */
+    int n, head;
+    double debt;                        /* sum of real - used, seconds */
+    unsigned fixes;                     /* debt payments in this window */
+    double max_debt;                    /* largest |debt| in this window */
+} dt_smooth_t;
+
+static void dt_smooth_reset(dt_smooth_t *s)
+{
+    s->n = s->head = 0;
+    s->debt = 0.0;
+}
+
+/* The dt to hand the game for this iteration. limit: the longest dt the game
+ * takes (seconds); hold: pass the real dt (cutscene, other time table). */
+static float dt_smooth_step(dt_smooth_t *s, float real, float limit, int hold)
+{
+    float sorted[DT_SM_RING], med, base, used;
+    double pend, v = DT_V;
+    int i, j, k, unpaid = 0;
+
+    if (limit > DT_SM_HITCH * DT_V)
+        limit = DT_SM_HITCH * DT_V;
+    if (hold || !(real > 0.0f) || real > limit) {
+        dt_smooth_reset(s);
+        return real;
+    }
+    s->ratio[s->head] = real / DT_V;
+    s->head = (s->head + 1) % DT_SM_RING;
+    if (s->n < DT_SM_RING)
+        s->n++;
+    for (i = 0; i < s->n; i++) {        /* insertion sort, n <= 8 */
+        float x = s->ratio[i];
+        for (j = i; j > 0 && sorted[j - 1] > x; j--)
+            sorted[j] = sorted[j - 1];
+        sorted[j] = x;
+    }
+    med = sorted[s->n / 2];
+    if (med < DT_SM_FAST)
+        return real;                    /* used = real: the debt stays */
+    k = (int)(med + 0.5f);
+    if (k < 1)
+        k = 1;
+    base = (float)(k * v);
+    used = base;
+    pend = s->debt + real - base;
+    if (pend > 1.5 * v) {
+        if (base + v <= limit)
+            used = (float)(base + v);
+        else
+            unpaid = 1;
+    } else if (pend < -1.5 * v) {
+        if (k > 1)
+            used = (float)(base - v);
+        else
+            unpaid = 1;
+    }
+    if (used != base)
+        s->fixes++;
+    s->debt += (double)real - used;
+    if (unpaid) {                       /* cannot go further: forgive the rest */
+        s->debt = s->debt > 0.0 ? 1.5 * v : -1.5 * v;
+    }
+    if (fabs(s->debt) > s->max_debt)
+        s->max_debt = fabs(s->debt);
+    return used;
+}
+/* DT_SMOOTH_END */
+
+static dt_smooth_t dt_sm;
+static int32_t dt_raw_n;                /* the game's own N for the last iteration */
+static int dt_raw_fresh;                /* set by the hook, taken by dt_hist */
+
+static int dt_smooth_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("NFSU2_DT_SMOOTH");
+        v = !(e && strcmp(e, "0") == 0);
+        fprintf(stderr, "[dt] smooth game time step: %s (NFSU2_DT_SMOOTH)\n", v ? "on" : "off");
+    }
+    return v;
+}
+
+/* sub_001890C0: cdecl (dt float), the main-loop time step. */
+extern void sub_001890C0_gen(void);
+
+void sub_001890C0(void)
+{
+    if (MEM32(esp) == 0x0018A9F0u && MEM32(0x428948u) == 0u) {
+        float real = MEMF(esp + 4), floor_s = dt_f32(MEM32(0x428EE8u));
+        float cap = MEMF(0x3A4C64u) * DT_V, t, used;
+        int hold = floor_s > DT_60_EPS || MEM32(0x3A4C50u) == 0u;
+
+        /* What the game computes from this dt: floor, cap, N. */
+        t = real > floor_s ? real : floor_s;
+        if (t > cap)
+            t = cap;
+        dt_raw_n = (int32_t)(t * 3600.0f + 0.5f);
+        dt_raw_fresh = 1;
+
+        used = dt_smooth_on() ? dt_smooth_step(&dt_sm, real, cap, hold) : real;
+        MEMF(esp + 4) = used;
+    }
+    sub_001890C0_gen();
+}
+
 /* ── Time step histogram at each swap ─────────────────────────
  *
  * Read-only, in every mode (swap_pre only runs with RECOMP_PRESENT_INTERVAL=1).
- * The time step has just stored this frame's N at 0x4289B4. Its clock is the
- * game's rdtsc "QueryPerformanceCounter" (733 MHz, steps far below 1 ms), so
- * N follows the real frame time: 120 per frame at 30 fps, 60 at 60 fps.
- * Every 10 s: swaps, N min/max/avg, the most common values (by value) and
- * the floor. A swap with N = 0 (no step) is counted apart and left out of
- * min/max/avg. RECOMP_DT_HIST=0 turns it off. */
+ * Two series, both in physics ticks per frame (3600 per second): raw is what
+ * the game would run from the real frame time (taken in the sub_001890C0
+ * hook above), used is what it ran (N stored at 0x4289B4 once the step has
+ * run, after NFSU2_DT_SMOOTH). The game's clock is the rdtsc
+ * "QueryPerformanceCounter" (733 MHz, steps far below 1 ms), so raw follows
+ * the real frame time: 120 per frame at 30 fps, 60 at 60 fps. Even steps of
+ * V still read 60, 60, 59 in used: the game keeps its remainder in 1/4000 s
+ * (0x3408C4), not 1/3600 s.
+ * Every 10 s: swaps, smoothing on or off, then for raw and used: min, max,
+ * avg and the most common values (by value); the number of debt payments and
+ * the largest |debt| in ms; the floor. A swap with N = 0 (no step) is counted
+ * apart and left out of min/max/avg. RECOMP_DT_HIST=0 turns it off. */
 #define DT_HIST_N   384                 /* values 0..383 (the step cap is 360); more go in the last slot */
 #define DT_HIST_TOP 8                   /* values printed */
+
+typedef struct {
+    unsigned cnt[DT_HIST_N + 1], n0, frames;
+    uint64_t sum;
+    int32_t min, max;
+} dt_stat_t;
+
+static void dt_stat_add(dt_stat_t *s, int32_t n)
+{
+    if (n <= 0) {
+        s->n0++;
+        return;
+    }
+    if (s->frames == 0 || n < s->min)
+        s->min = n;
+    if (n > s->max)
+        s->max = n;
+    s->sum += (uint32_t)n;
+    s->frames++;
+    s->cnt[n < DT_HIST_N ? n : DT_HIST_N]++;
+}
+
+/* "min a max b avg c, spread: v:count ..." onto line; returns the new length. */
+static int dt_stat_text(dt_stat_t *s, char *line, int len, size_t size)
+{
+    char pick[DT_HIST_N + 1] = { 0 };
+    int k, i;
+
+    len += snprintf(line + len, size - len, "min %d max %d avg %.2f, spread:",
+                    s->min, s->max, s->frames ? (double)s->sum / s->frames : 0.0);
+    for (k = 0; k < DT_HIST_TOP; k++) {
+        int best = -1;
+        for (i = 0; i <= DT_HIST_N; i++)
+            if (!pick[i] && s->cnt[i] && (best < 0 || s->cnt[i] > s->cnt[best]))
+                best = i;
+        if (best < 0)
+            break;
+        pick[best] = 1;
+    }
+    for (i = 0; i <= DT_HIST_N; i++)
+        if (pick[i]) {
+            if (i == DT_HIST_N)
+                len += snprintf(line + len, size - len, " >%d:%u", DT_HIST_N - 1, s->cnt[i]);
+            else
+                len += snprintf(line + len, size - len, " %d:%u", i, s->cnt[i]);
+        }
+    return len;
+}
 
 static void dt_hist(void)
 {
     static int on = -1;
-    static unsigned cnt[DT_HIST_N + 1], swaps, n0;
-    static uint64_t nsum;
-    static int32_t nmin, nmax;
+    static dt_stat_t raw, used;
+    static unsigned swaps;
     static double t0;
     struct timespec ts;
     double now;
-    int32_t n;
 
     if (on < 0) {
         const char *e = getenv("RECOMP_DT_HIST");
@@ -615,17 +812,11 @@ static void dt_hist(void)
     }
     if (!on)
         return;
-    n = (int32_t)MEM32(0x4289B4u);
     swaps++;
-    if (n <= 0) {
-        n0++;
-    } else {
-        if (nsum == 0 || n < nmin)
-            nmin = n;
-        if (n > nmax)
-            nmax = n;
-        nsum += (uint32_t)n;
-        cnt[n < DT_HIST_N ? n : DT_HIST_N]++;
+    dt_stat_add(&used, (int32_t)MEM32(0x4289B4u));
+    if (dt_raw_fresh) {                 /* one raw value per game iteration */
+        dt_stat_add(&raw, dt_raw_n);
+        dt_raw_fresh = 0;
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -633,40 +824,149 @@ static void dt_hist(void)
     if (t0 == 0.0)
         t0 = now;
     if (now - t0 >= 10.0) {
-        char pick[DT_HIST_N + 1] = { 0 }, line[384];
-        unsigned frames = swaps - n0;
-        int k, i, len;
+        char line[768];
+        int len;
 
         /* One write, so other threads' log lines do not cut it. */
-        len = snprintf(line, sizeof line,
-                       "[dt] 10 s: %u swaps, ticks/frame min %d max %d avg %.2f, spread:",
-                       swaps, nmin, nmax, frames ? (double)nsum / frames : 0.0);
-        for (k = 0; k < DT_HIST_TOP; k++) {
-            int best = -1;
-            for (i = 0; i <= DT_HIST_N; i++)
-                if (!pick[i] && cnt[i] && (best < 0 || cnt[i] > cnt[best]))
-                    best = i;
-            if (best < 0)
-                break;
-            pick[best] = 1;
-        }
-        for (i = 0; i <= DT_HIST_N; i++)
-            if (pick[i]) {
-                if (i == DT_HIST_N)
-                    len += snprintf(line + len, sizeof line - len, " >%d:%u", DT_HIST_N - 1, cnt[i]);
-                else
-                    len += snprintf(line + len, sizeof line - len, " %d:%u", i, cnt[i]);
-            }
-        if (n0)
-            len += snprintf(line + len, sizeof line - len, ", N0 %u", n0);
-        snprintf(line + len, sizeof line - len, ", floor %.6f\n", dt_f32(MEM32(0x428EE8u)));
+        len = snprintf(line, sizeof line, "[dt] 10 s: %u swaps, smooth %s, ticks/frame raw ",
+                       swaps, dt_smooth_on() ? "on" : "off");
+        len = dt_stat_text(&raw, line, len, sizeof line);
+        len += snprintf(line + len, sizeof line - len, ", used ");
+        len = dt_stat_text(&used, line, len, sizeof line);
+        if (used.n0)
+            len += snprintf(line + len, sizeof line - len, ", N0 %u", used.n0);
+        snprintf(line + len, sizeof line - len, ", debt fixes %u max %.1f ms, floor %.6f\n",
+                 dt_sm.fixes, dt_sm.max_debt * 1000.0, dt_f32(MEM32(0x428EE8u)));
         fputs(line, stderr);
-        memset(cnt, 0, sizeof cnt);
-        swaps = n0 = 0;
-        nsum = 0;
-        nmin = nmax = 0;
+        memset(&raw, 0, sizeof raw);
+        memset(&used, 0, sizeof used);
+        swaps = 0;
+        dt_sm.fixes = 0;
+        dt_sm.max_debt = 0.0;
         t0 = now;
     }
+}
+
+/* ── Load screens at 60 fps (sub_00253AD5, swap wrappers) ───
+ *
+ * A load is bound by the game's frame, not by the disc: the game thread
+ * queues one reader job per frame (sub_00253AD5 builds the job and sets the
+ * reader thread's event) and the reader thread reads about 120 KB for it. At
+ * the game's own 30 fps a load takes twice the time it takes at 60 (Circuit
+ * on Linux 6.5 s against 3.5 s; on an iPhone about 20 s against under 10).
+ * On Linux the race loading screen at 30 fps often holds one stretch of about
+ * 17 s with no job and the game thread idle; with this forcing from the first
+ * job it did not come up in 4 runs (5 of 6 runs without it had it).
+ *
+ * The hook counts the jobs. A swap is a load swap when a job came since the
+ * last swap. Loading starts when 8 of the last 10 swaps are load swaps and
+ * ends when none of the last 10 is. While it runs, the swap present interval
+ * is forced to every vblank (force_interval, as RECOMP_PRESENT_INTERVAL=1
+ * does) and put back when it ends. The time floor is not touched. No forcing
+ * while the heat cap is on or the game's floor is above 1/60 (cutscene: the
+ * NIS plays at 30 fps). The smooth time step starts over at each change of
+ * the rate, so its median does not run behind the new rate. Forcing stops
+ * when one stretch runs past 30 s (no measured load comes near it; a stream
+ * that never pauses, as free roam could be, is not a loading screen) and
+ * comes back only after a stretch with no job.
+ *
+ * RECOMP_LOAD_FAST=0 only logs. RECOMP_PRESENT_INTERVAL=1 already presents
+ * every vblank and only logs. One line per load:
+ *   [load] <s> s, <frames> frames, <kicks> loader kicks, fast on|off */
+extern void sub_00253AD5_gen(void);
+
+#define LOAD_RING   10                  /* swaps the rule looks at */
+#define LOAD_START  8                   /* load swaps among them: loading */
+#define LOAD_MAX_S  30.0                /* longest forced stretch, seconds */
+
+typedef struct {
+    double t0, t1;                      /* the frame's start and its swap, seconds */
+    unsigned swap, kicks;               /* swap number, jobs in this frame */
+    unsigned long total;                /* jobs up to and with this frame */
+} load_swap_t;
+
+static unsigned load_kicks;             /* jobs since the last swap */
+
+static int load_fast_wanted(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_LOAD_FAST");
+        v = !(e && strcmp(e, "0") == 0);
+        fprintf(stderr, "[load] 60 fps load screens: %s (RECOMP_LOAD_FAST)\n", v ? "on" : "off");
+    }
+    return v;
+}
+
+static void load_swap(uint32_t slot)
+{
+    static load_swap_t ring[LOAD_RING], first, last;
+    static unsigned swaps, forced;
+    static unsigned long total;
+    static int active, forcing, capped;
+    static double prev;
+    load_swap_t cur;
+    struct timespec ts;
+    double now;
+    unsigned i, n = 0;
+    int want, fast = load_fast_wanted();
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    total += load_kicks;
+    cur = (load_swap_t){ prev ? prev : now, now, swaps, load_kicks, total };
+    ring[swaps % LOAD_RING] = cur;
+    prev = now;
+    swaps++;
+    load_kicks = 0;
+    if (cur.kicks)
+        last = cur;
+    for (i = 0; i < LOAD_RING; i++)
+        n += ring[i].kicks != 0;
+
+    if (!active && n >= LOAD_START) {   /* start at the oldest load swap of the window */
+        active = 1;
+        forced = 0;
+        capped = 0;
+        first = cur;
+        for (i = 0; i < LOAD_RING; i++)
+            if (ring[i].kicks && ring[i].swap < first.swap)
+                first = ring[i];
+    } else if (active && n == 0) {
+        fprintf(stderr, "[load] %.1f s, %u frames, %lu loader kicks, fast %s\n",
+                last.t1 - first.t0, last.swap - first.swap + 1,
+                last.total - first.total + first.kicks, forced ? "on" : "off");
+        active = 0;
+    }
+    if (active && !capped && now - first.t0 > LOAD_MAX_S) {
+        capped = 1;
+        fprintf(stderr, "[load] still loading after %.0f s: back to the game's own rate\n", LOAD_MAX_S);
+    }
+
+    want = active && !capped && fast && !swap_interval_wanted() && !xbox_power_hot_cap()
+           && dt_f32(MEM32(0x428EE8u)) <= DT_60_EPS;
+    if (want) {
+        force_interval(slot);
+        forced += s_forced;             /* 0 while the game's value is already every vblank */
+    } else if (!swap_interval_wanted()) {   /* swap_pre owns the slot then */
+        unforce_interval(slot);
+    }
+    if (want != forcing) {              /* the game's frame time changes now */
+        forcing = want;
+        dt_smooth_reset(&dt_sm);
+    }
+}
+
+/* sub_00253AD5: cdecl (4 args), builds a stream job and sets the reader's
+ * event. Counted when the loader calls it (sub_00186A00, sub_00186B80); the
+ * stream code at 0x72B40, the file layer at 0x252314 and the rest call it
+ * for other jobs, now and then in menus. */
+void sub_00253AD5(void)
+{
+    uint32_t ret = MEM32(esp);
+    if (ret == 0x00186AE6u || ret == 0x00186C6Fu)
+        load_kicks++;
+    sub_00253AD5_gen();
 }
 
 static void unimpl_tick(void);
@@ -675,6 +975,7 @@ void sub_002EB4B0(void)
 {
     unimpl_tick();
     dt_hist();
+    load_swap(0x2F76FCu);
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
     sub_002EB4B0_gen();
@@ -684,6 +985,7 @@ void sub_002EB6A0(void)
 {
     unimpl_tick();
     dt_hist();
+    load_swap(0x2F76FCu);
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
     sub_002EB6A0_gen();
