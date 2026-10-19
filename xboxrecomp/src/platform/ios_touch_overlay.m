@@ -2012,7 +2012,10 @@ static void path_add_rect(UIBezierPath *p, CGRect r)
 
 static Nfsu2Overlay *s_ov;
 static UILabel *s_fps;
-static UIScrollView *s_panel;      /* on the window, above the overlay */
+static UIView *s_panel;            /* on the window, above the overlay */
+static UIView *s_head;             /* in s_panel: title, Done, tabs; does not scroll */
+static UIScrollView *s_rows;       /* in s_panel, below s_head: the rows of one tab */
+static int s_tab;                  /* shown tab: the n-th IK_HEAD of s_items */
 
 /* The shapes show when touch is on and no pad/keyboard has taken over. */
 static void refresh_shapes(void)
@@ -2539,6 +2542,74 @@ static NSString *ns(const char *c)
     return [NSString stringWithUTF8String:c ? c : ""];
 }
 
+/* ── Tabs: one per IK_HEAD row of s_items ──
+ * A head reads "Display — applies on next launch": the text before " — " is the
+ * tab title, the text after it shows as a grey line at the top of the tab. */
+
+static int tab_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < ITEM_COUNT; i++)
+        if (s_items[i].kind == IK_HEAD)
+            n++;
+    return n;
+}
+
+/* Index in s_items of the head of tab t, or -1. */
+static int tab_head(int t)
+{
+    int n = 0;
+    for (int i = 0; i < ITEM_COUNT; i++)
+        if (s_items[i].kind == IK_HEAD && n++ == t)
+            return i;
+    return -1;
+}
+
+static NSString *tab_title(int t)
+{
+    int h = tab_head(t);
+    if (h < 0)
+        return @"";
+    NSString *s = ns(s_items[h].title);
+    NSRange r = [s rangeOfString:@" — "];
+    return r.location == NSNotFound ? s : [s substringToIndex:r.location];
+}
+
+/* The part of the head after " — " with a capital, or nil. */
+static NSString *tab_note(const PanelItem *head)
+{
+    NSString *s = ns(head->title);
+    NSRange r = [s rangeOfString:@" — "];
+    if (r.location == NSNotFound)
+        return nil;
+    NSString *n = [s substringFromIndex:r.location + r.length];
+    if (n.length == 0)
+        return nil;
+    return [[[n substringToIndex:1] uppercaseString] stringByAppendingString:[n substringFromIndex:1]];
+}
+
+/* The last tab is UI state, not a setting: NSUserDefaults, by title, so a
+ * reordered table still lands on the same tab. Missing or odd: the first. */
+static NSString *const kTabKey = @"nfsu2.settings.tab";
+
+static void tab_load(void)
+{
+    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:kTabKey];
+    s_tab = 0;
+    if (saved.length == 0)
+        return;
+    for (int t = 0; t < tab_count(); t++)
+        if ([tab_title(t) isEqualToString:saved]) {
+            s_tab = t;
+            break;
+        }
+}
+
+static void tab_save(void)
+{
+    [[NSUserDefaults standardUserDefaults] setObject:tab_title(s_tab) forKey:kTabKey];
+}
+
 /* Caption of a button row, with the stored value where there is one. */
 static NSString *button_title(int act)
 {
@@ -2567,29 +2638,31 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
         /* A group inside a section: a hairline and a lighter, smaller title. */
         UIView *rule = [[UIView alloc] initWithFrame:CGRectMake(12, y + 6, w - 24, 1)];
         rule.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
-        [s_panel addSubview:rule];
-        [s_panel addSubview:panel_label(ns(it->title), CGRectMake(12, y + 10, w - 24, 18), 12,
+        [s_rows addSubview:rule];
+        [s_rows addSubview:panel_label(ns(it->title), CGRectMake(12, y + 10, w - 24, 18), 12,
                                         [UIColor colorWithWhite:1.0 alpha:0.72], YES)];
         return y + 32;
     }
     if (it->kind == IK_HEAD) {
-        y += 8;
-        [s_panel addSubview:panel_label(ns(it->title), CGRectMake(12, y, w - 24, 20), 12,
-                                        [UIColor colorWithRed:0.55 green:0.75 blue:1.0 alpha:1.0],
-                                        YES)];
+        /* The tab bar shows the title; only the note under it is drawn here. */
+        NSString *note = tab_note(it);
+        if (!note)
+            return y;
+        [s_rows addSubview:panel_label(note, CGRectMake(12, y + 4, w - 24, 16), 11,
+                                       [UIColor lightGrayColor], NO)];
         return y + 24;
     }
     if (it->kind == IK_SWITCH) {
-        [s_panel addSubview:panel_label(ns(it->title), CGRectMake(12, y + 6, w - 24 - 59, 24), 13,
+        [s_rows addSubview:panel_label(ns(it->title), CGRectMake(12, y + 6, w - 24 - 59, 24), 13,
                                         white, NO)];
         UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 12 - 51, y + 2, 51, 31)];
         sw.on = item_is_on(it) ? YES : NO;
         sw.tag = idx + 1;
         [sw addTarget:s_target action:@selector(switchChanged:)
                     forControlEvents:UIControlEventValueChanged];
-        [s_panel addSubview:sw];
+        [s_rows addSubview:sw];
         if (it->note) {
-            [s_panel addSubview:panel_label(ns(it->note), CGRectMake(12, y + 34, w - 24, 16), 11,
+            [s_rows addSubview:panel_label(ns(it->note), CGRectMake(12, y + 34, w - 24, 16), 11,
                                             [UIColor lightGrayColor], NO)];
             return y + 54;
         }
@@ -2599,13 +2672,13 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
         char buf[24];
         float v = item_slider_value(it);
         format_slider(it, v, buf, sizeof buf);
-        [s_panel addSubview:panel_label(ns(it->title), CGRectMake(12, y + 2, w - 24 - 70, 20), 13,
+        [s_rows addSubview:panel_label(ns(it->title), CGRectMake(12, y + 2, w - 24 - 70, 20), 13,
                                         white, NO)];
         UILabel *vl = panel_label(ns(buf), CGRectMake(w - 12 - 70, y + 2, 70, 20), 13,
                                   [UIColor lightGrayColor], NO);
         vl.textAlignment = NSTextAlignmentRight;
         vl.tag = 1000 + idx;
-        [s_panel addSubview:vl];
+        [s_rows addSubview:vl];
         UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(12, y + 22, w - 24, 28)];
         sl.minimumValue = it->lo;
         sl.maximumValue = it->hi;
@@ -2619,7 +2692,7 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
                   forControlEvents:(UIControlEventTouchUpInside |
                                     UIControlEventTouchUpOutside |
                                     UIControlEventTouchCancel)];
-        [s_panel addSubview:sl];
+        [s_rows addSubview:sl];
         return y + 54;
     }
     if (it->kind == IK_BUTTON) {
@@ -2630,7 +2703,7 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
         bt.tag = idx + 1;
         [bt addTarget:s_target action:@selector(buttonTapped:)
                   forControlEvents:UIControlEventTouchUpInside];
-        [s_panel addSubview:bt];
+        [s_rows addSubview:bt];
         return y + 40;
     }
     /* IK_SEG */
@@ -2658,7 +2731,7 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
         }
         if (sel < 0)
             sel = defsel;
-        [s_panel addSubview:panel_label(ns(it->title), CGRectMake(12, y + 2, w - 24, 20), 13,
+        [s_rows addSubview:panel_label(ns(it->title), CGRectMake(12, y + 2, w - 24, 20), 13,
                                         white, NO)];
         UISegmentedControl *sg = [[UISegmentedControl alloc] initWithItems:labels];
         sg.frame = CGRectMake(12, y + 24, w - 24, 30);
@@ -2666,56 +2739,108 @@ static CGFloat panel_add_item(int idx, CGFloat y, CGFloat w)
         sg.tag = idx + 1;
         [sg addTarget:s_target action:@selector(segChanged:)
                   forControlEvents:UIControlEventValueChanged];
-        [s_panel addSubview:sg];
+        [s_rows addSubview:sg];
         return y + 60;
     }
 }
 
-/* Built again at every open: the controls always show what is stored. */
-static void panel_rebuild(CGFloat w)
+static CGFloat s_panel_w;                 /* width the rows were laid out for */
+static CGFloat s_head_h;                  /* height of s_head, set by panel_rebuild */
+
+/* Rows of the shown tab (its head, then the items up to the next head).
+ * Built again at every open and at every tab change: the controls always show
+ * what is stored. Sets the content size and scrolls to the top. */
+static void panel_build_rows(CGFloat w)
 {
-    CGFloat y = 8;
-    NSArray *old = [s_panel.subviews copy];
+    CGFloat y = 4;
+    BOOL kbd = NO;
+    NSArray *old = [s_rows.subviews copy];
     for (UIView *v in old)
         [v removeFromSuperview];
 
-    [s_panel addSubview:panel_label(@"Settings", CGRectMake(12, y, w - 110, 28), 17,
-                                    UIColor.whiteColor, YES)];
+    int first = tab_head(s_tab);
+    for (int i = first < 0 ? 0 : first; i < ITEM_COUNT; i++) {
+        if (i > first && s_items[i].kind == IK_HEAD)
+            break;
+        if (s_items[i].act == ACT_KEYBOARD)
+            kbd = YES;
+        y = panel_add_item(i, y, w);
+    }
+
+    /* The key list goes with the Keyboard switch, the launch note with the
+     * tabs that have one. */
+    NSMutableString *help = [NSMutableString string];
+    if (first >= 0 && tab_note(&s_items[first]))
+        [help appendString:@"Items marked 'applies on next launch' take effect after you "
+                           @"close and reopen the app."];
+    if (kbd) {
+        if (help.length)
+            [help appendString:@"\n\n"];
+        [help appendString:@"Keyboard: arrows = D-pad, W gas, S brake, A/D steer, "
+                           @"Return/Space = A, Esc/Backspace = B, Shift = X, Ctrl = Y, Q/E = LB/RB, "
+                           @"Tab/P = Start, O or ` = Back, I/J/K/L = right stick."];
+    }
+    y += 8;
+    if (help.length) {
+        UILabel *foot = panel_label(help, CGRectMake(12, y, w - 24, 10), 11,
+                                    [UIColor lightGrayColor], NO);
+        foot.numberOfLines = 0;
+        CGSize fs = [foot sizeThatFits:CGSizeMake(w - 24, CGFLOAT_MAX)];
+        foot.frame = CGRectMake(12, y, w - 24, fs.height);
+        [s_rows addSubview:foot];
+        y += fs.height + 14;
+    }
+    s_rows.contentSize = CGSizeMake(w, y);
+    s_rows.contentOffset = CGPointZero;
+}
+
+/* Built again at every open and every width change: the fixed head (title,
+ * Done, tab bar) and the rows of the shown tab. The tabs share the title row
+ * when the panel is wide (a landscape iPhone), else sit on a row of their own. */
+static void panel_rebuild(CGFloat w)
+{
+    CGFloat y = 8;
+    int nt = tab_count();
+    BOOL one_row = (w >= 480.0);
+    NSArray *old = [s_head.subviews copy];
+    for (UIView *v in old)
+        [v removeFromSuperview];
+
+    [s_head addSubview:panel_label(@"Settings", CGRectMake(12, y, one_row ? 80 : w - 110, 28), 17,
+                                   UIColor.whiteColor, YES)];
     UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem];
     done.frame = CGRectMake(w - 12 - 80, y, 80, 28);
     [done setTitle:@"Done" forState:UIControlStateNormal];
     done.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     [done addTarget:s_target action:@selector(doneTapped)
         forControlEvents:UIControlEventTouchUpInside];
-    [s_panel addSubview:done];
-    y += 34;
-
-    for (int i = 0; i < ITEM_COUNT; i++)
-        y = panel_add_item(i, y, w);
-
-    y += 8;
-    UILabel *foot = panel_label(
-        @"Items under 'applies on next launch' take effect after you close and reopen the app.\n\n"
-        @"Keyboard: arrows = D-pad, W gas, S brake, A/D steer, "
-        @"Return/Space = A, Esc/Backspace = B, Shift = X, Ctrl = Y, Q/E = LB/RB, "
-        @"Tab/P = Start, O or ` = Back, I/J/K/L = right stick.",
-        CGRectMake(12, y, w - 24, 10), 11, [UIColor lightGrayColor], NO);
-    foot.numberOfLines = 0;
-    CGSize fs = [foot sizeThatFits:CGSizeMake(w - 24, CGFLOAT_MAX)];
-    foot.frame = CGRectMake(12, y, w - 24, fs.height);
-    [s_panel addSubview:foot];
-    y += fs.height + 14;
-    s_panel.contentSize = CGSizeMake(w, y);
-    s_panel.contentOffset = CGPointZero;
+    [s_head addSubview:done];
+    if (nt > 1) {
+        NSMutableArray *titles = [NSMutableArray array];
+        for (int t = 0; t < nt; t++)
+            [titles addObject:tab_title(t)];
+        UISegmentedControl *tabs = [[UISegmentedControl alloc] initWithItems:titles];
+        if (one_row)
+            tabs.frame = CGRectMake(12 + 80 + 12, y, w - 24 - 80 - 12 - 80 - 12, 28);
+        else
+            tabs.frame = CGRectMake(12, y + 34, w - 24, 28);
+        [tabs setTitleTextAttributes:@{ NSFontAttributeName : [UIFont systemFontOfSize:12] }
+                            forState:UIControlStateNormal];
+        tabs.selectedSegmentIndex = s_tab;
+        [tabs addTarget:s_target action:@selector(tabChanged:)
+                    forControlEvents:UIControlEventValueChanged];
+        [s_head addSubview:tabs];
+        y += one_row ? 0 : 34;
+    }
+    s_head_h = y + 28 + 6;
+    panel_build_rows(w);
 }
-
-static CGFloat s_panel_w;                 /* width the rows were laid out for */
 
 /* Place the panel inside the safe area, below the gear: at most 85 % of the
  * window height and never past the bottom inset, and no taller than its
- * content. The content scrolls when it is taller (a 667 x 375 landscape
- * iPhone SE gets a 315 pt panel). The rows are laid out again when the window
- * width changed since they were built. */
+ * content. The head stays; the rows scroll when they are taller (a 667 x 375
+ * landscape iPhone SE gets a 315 pt panel). Everything is laid out again when
+ * the window width changed since it was built. */
 static void panel_fit(void)
 {
     CGRect wb;
@@ -2728,7 +2853,7 @@ static void panel_fit(void)
     sa = s_win.safeAreaInsets;
     pw = floor(wb.size.width * 0.7);
     if (fabs(pw - s_panel_w) > 0.5) {
-        panel_rebuild(pw);              /* sets contentSize */
+        panel_rebuild(pw);              /* sets s_head_h and the content size */
         s_panel_w = pw;
     }
     top = sa.top + 52;
@@ -2737,24 +2862,42 @@ static void panel_fit(void)
     ph = maxh < room ? maxh : room;
     if (ph < 120.0)
         ph = 120.0;
-    if (s_panel.contentSize.height < ph)
-        ph = s_panel.contentSize.height;
+    if (s_head_h + s_rows.contentSize.height < ph)
+        ph = s_head_h + s_rows.contentSize.height;
     s_panel.frame = CGRectMake(floor((wb.size.width - pw) / 2), top, pw, ph);
+    s_head.frame = CGRectMake(0, 0, pw, s_head_h);
+    s_rows.frame = CGRectMake(0, s_head_h, pw, ph > s_head_h ? ph - s_head_h : 0);
 }
 
 /* Fill the panel from the stored values and show it. */
 static void panel_show(void)
 {
+    static BOOL s_tab_loaded;
+    if (!s_tab_loaded) {                /* the last tab of the previous launch */
+        tab_load();
+        s_tab_loaded = YES;
+    }
     s_panel.hidden = NO;                /* panel_fit skips a hidden panel */
     s_panel_w = -1.0;                   /* force a fresh build */
     panel_fit();
     [s_win bringSubviewToFront:s_panel];
-    [s_panel flashScrollIndicators];
+    [s_rows flashScrollIndicators];
 }
 
 static void panel_hide(void)
 {
     s_panel.hidden = YES;
+}
+
+/* A tab was tapped: remember it, build its rows, fit the panel to them. */
+static void panel_set_tab(NSInteger t)
+{
+    if (t < 0 || t >= tab_count() || t == s_tab)
+        return;
+    s_tab = (int)t;
+    tab_save();
+    panel_build_rows(s_panel_w);
+    panel_fit();
 }
 
 /* UIControl targets: NSObject categories can't reach our statics, so route
@@ -2804,7 +2947,7 @@ static void power_sample(void)
     const PanelItem *it = &s_items[idx];
     char buf[24];
     format_slider(it, sl.value, buf, sizeof buf);
-    UILabel *vl = (UILabel *)[s_panel viewWithTag:1000 + idx];
+    UILabel *vl = (UILabel *)[s_rows viewWithTag:1000 + idx];
     if ([vl isKindOfClass:[UILabel class]])
         vl.text = ns(buf);
     if (it->act == ACT_ALPHA)    /* cheap, so it follows the thumb */
@@ -2854,6 +2997,11 @@ static void power_sample(void)
     NSString *v = [vals objectAtIndex:(NSUInteger)k];
     nfsu2_cfg_set(it->key, [v UTF8String]);
     apply_live(it->act, 1, (float)[v doubleValue], [v UTF8String]);
+}
+
+- (void)tabChanged:(UISegmentedControl *)sg
+{
+    panel_set_tab(sg.selectedSegmentIndex);
 }
 
 - (void)doneTapped
@@ -3146,16 +3294,21 @@ void ios_touch_overlay_install(void *uiwindow)
 
     /* The panel lives on the window, not in the overlay: the overlay's alpha
      * (the Opacity setting) must not fade the menu. Built when opened. */
-    s_panel = [[UIScrollView alloc] initWithFrame:CGRectZero];
+    s_panel = [[UIView alloc] initWithFrame:CGRectZero];
     s_panel.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.92];
     s_panel.layer.cornerRadius = 10;
     s_panel.clipsToBounds = YES;
     s_panel.hidden = YES;
     s_panel.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
-    /* The panel sits inside the safe area already and scrolls on its own: no
-     * automatic inset, a visible indicator for the long list. */
-    s_panel.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
-    s_panel.showsVerticalScrollIndicator = YES;
+    /* The head (title, Done, tabs) stays put; the rows scroll under it. The
+     * panel sits inside the safe area already: no automatic inset, a visible
+     * indicator for a long tab. */
+    s_head = [[UIView alloc] initWithFrame:CGRectZero];
+    [s_panel addSubview:s_head];
+    s_rows = [[UIScrollView alloc] initWithFrame:CGRectZero];
+    s_rows.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    s_rows.showsVerticalScrollIndicator = YES;
+    [s_panel addSubview:s_rows];
     [win addSubview:s_panel];
 
     build_fps_and_gear();
