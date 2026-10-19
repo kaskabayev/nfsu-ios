@@ -27,8 +27,8 @@
 #define NFSU_IOS_DATA_FOLDERS       { "NFSU2-data", "game", "nfsu2", "NFSU2" }
 
 /* Launch screen and log banner. */
-#define NFSU_BUILD_TAG      "v34c"
-#define NFSU_BUILD_NOTE     "v34b + pacing off by default, time-step log"
+#define NFSU_BUILD_TAG      "v34d"
+#define NFSU_BUILD_NOTE     "v34c + smooth time step, fast loads, settings tabs"
 
 /* The disc this build expects. These values belong to the gen/ the binary was
  * built from (the XBE the lifter read), so they must change together with it:
