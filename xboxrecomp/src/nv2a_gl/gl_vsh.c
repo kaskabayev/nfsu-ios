@@ -278,7 +278,7 @@ int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
  * a vertex program under any surface. */
 /* Vulkan GLSL (nv2a_vk): the same shader with explicit locations, the
  * uniforms in a std140 block (binding 0) and Vulkan's 0..1 clip depth. */
-static const char s_vk_prelude[] =
+static const char s_vk_head[] =
     "#version 450\n"
     "invariant gl_Position;               /* same vertex, same position from\n"
     "                                        every pipeline: no cracks */\n"
@@ -332,11 +332,24 @@ static const char s_vk_prelude[] =
     "    float lx = max(s.x, 0.0), ly = max(s.y, 0.0), w = clamp(s.w, -127.996, 127.996);\n"
     "    return vec4(1.0, lx, (lx > 0.0 && ly > 0.0) ? exp2(w * log2(ly)) : 0.0, 1.0);\n"
     "}\n"
-    /* z clamped only in front of the eye (w > 0). Behind it (w < 0) the
-     * vertex is clipped by x/y anyway and its true z is about w: clamping it
-     * to 0 skewed the interpolated depth of triangles crossing the eye plane
-     * (walls in hood view turned transparent, objects showed through them). */
-    NV2A_SNAP_VK_GLSL
+    NV2A_SNAP_VK_GLSL;
+
+/* nv2a_clip, two ways. The NV2A clamps depth per fragment; depthClamp
+ * (nv2a_vk.c, nv2a_vk_zpass) does the same, so z passes through. A
+ * per-vertex clamp tilted the depth plane of every triangle that crosses the
+ * near plane: its far part lost the depth test against geometry behind it, and
+ * world walls flashed for a frame. Without depthClamp the clamp stays, in
+ * front of the eye only (w > 0). Behind it (w < 0) the vertex is clipped by
+ * x/y anyway and its true z is about w: clamping it to 0 skewed the
+ * interpolated depth of triangles crossing the eye plane (walls in hood view
+ * turned transparent, objects showed through them). */
+static const char s_vk_clip_pass[] =
+    "vec4 nv2a_clip(vec3 sw, float w) {\n"
+    "    float z = sw.z * u_surf.z;\n"
+    "    sw.xy = nv2a_snap(sw.xy, w);\n"
+    "    return vec4(sw.x * u_surf.x - w, sw.y * u_surf.y - w, z, w);\n"
+    "}\n";
+static const char s_vk_clip_clamp[] =
     "vec4 nv2a_clip(vec3 sw, float w) {\n"
     "    float z = sw.z * u_surf.z;\n"
     "    sw.xy = nv2a_snap(sw.xy, w);\n"
@@ -345,11 +358,17 @@ static const char s_vk_prelude[] =
     "}\n";
 
 int nv2a_shader_vk;
+int nv2a_vk_zpass;
 
 const char *nv2a_gl_vsh_prelude(void)
 {
-    if (nv2a_shader_vk)
-        return s_vk_prelude;
+    if (nv2a_shader_vk) {
+        static char vk[sizeof s_vk_head + sizeof s_vk_clip_clamp];
+        if (!vk[0])
+            snprintf(vk, sizeof vk, "%s%s", s_vk_head,
+                     nv2a_vk_zpass ? s_vk_clip_pass : s_vk_clip_clamp);
+        return vk;
+    }
     return
         "#version 330 core\n"
         "layout(location = 0) in vec4 v0;\n"

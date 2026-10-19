@@ -12,6 +12,9 @@ int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
 
 /* Nonzero: emit Vulkan GLSL (nv2a_vk). Set once, before the first shader. */
 extern int nv2a_shader_vk;
+/* Vulkan: nonzero = nv2a_clip passes z through (the pipeline's depthClamp
+ * clamps per fragment). Set once with nv2a_shader_vk, before the first shader. */
+extern int nv2a_vk_zpass;
 
 /* Declarations and helpers every vertex shader starts with. */
 const char *nv2a_gl_vsh_prelude(void);

@@ -3599,6 +3599,20 @@ static int ready_impl(void)
     vkGetPhysicalDeviceFeatures(s_pd, &have);
     s_have_bc = have.textureCompressionBC;
     s_have_depth_clamp = have.depthClamp;
+    {
+        /* RECOMP_VK_ZCLAMP=1 forces the per-vertex z clamp back (A/B). The
+         * Switch keeps it by default (=0 drops it): not tested there, and the
+         * GL path's clamp came from a driver (Eden) that lost a loading screen. */
+        const char *e = getenv("RECOMP_VK_ZCLAMP");
+#if defined(__SWITCH__)
+        int zclamp = !(e && *e == '0');
+#else
+        int zclamp = e && *e && *e != '0';
+#endif
+        nv2a_vk_zpass = s_have_depth_clamp && !zclamp;
+        fprintf(stderr, "[VK] vertex z: %s\n", nv2a_vk_zpass ? "pass (depth clamp)" : "clamp");
+        nv2a_gl_vsh_prelude();          /* built here, before any shader thread reads it */
+    }
     s_have_aniso = have.samplerAnisotropy && s_max_aniso_dev >= 2.0f;
     {
         VkFormatProperties fp;
