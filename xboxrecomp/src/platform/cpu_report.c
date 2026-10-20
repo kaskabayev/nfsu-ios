@@ -6,7 +6,7 @@
  * of the process, keeps the last sample, and prints the difference. It never
  * calls guest code and never takes the guest lock.
  *
- *   [cpu] 10.0 s: 143% of a core; game 62%, nv2a-exec 41%, ..., others 8% (17 threads); wakeups 2300/s; thermal fair, ...
+ *   [cpu] 10.0 s: 143% of a core; game 62%, nv2a-exec 41%, ..., others 8% (17 threads); wakeups 2300/s; gpu 35%, cpu energy 820 mW; thermal fair, ...
  *
  * Linux: /proc/self/task/<tid>/{stat,status}. Apple: task_threads() and
  * thread_info(). Both need only public APIs.
@@ -250,6 +250,9 @@ struct cr_sample {
     int      total;         /* live threads, also those past the table */
     uint64_t task_wakeups;  /* Apple: interrupt + idle wakeups so far */
     int      have_task_wakeups;
+    uint64_t gpu_ns;        /* Apple: GPU time billed to this task so far */
+    uint64_t energy_nj;     /* Apple arm: kernel CPU energy estimate so far */
+    int      have_gpu, have_energy;
 };
 
 static uint64_t cr_now_us(void)
@@ -277,6 +280,10 @@ static void cr_sample_take(struct cr_sample *s)
     s->total = 0;
     s->task_wakeups = 0;
     s->have_task_wakeups = 0;
+    s->gpu_ns = 0;
+    s->energy_nj = 0;
+    s->have_gpu = 0;
+    s->have_energy = 0;
 
 #if defined(TASK_POWER_INFO) && defined(TASK_POWER_INFO_COUNT)
     {
@@ -286,6 +293,24 @@ static void cr_sample_take(struct cr_sample *s)
         if (task_info(mach_task_self(), TASK_POWER_INFO, (task_info_t)&pi, &cnt) == KERN_SUCCESS) {
             s->task_wakeups = pi.task_interrupt_wakeups + pi.task_platform_idle_wakeups;
             s->have_task_wakeups = 1;
+        }
+    }
+#endif
+#if defined(TASK_POWER_INFO_V2) && defined(TASK_POWER_INFO_V2_COUNT)
+    /* task_gpu_utilisation is the GPU time billed to this task (ns).
+     * task_energy is the kernel's CPU energy estimate (nJ), not the power of
+     * the whole phone. Use both for A/B runs only. */
+    {
+        task_power_info_v2_data_t pi2;
+        mach_msg_type_number_t cnt = TASK_POWER_INFO_V2_COUNT;
+
+        if (task_info(mach_task_self(), TASK_POWER_INFO_V2, (task_info_t)&pi2, &cnt) == KERN_SUCCESS) {
+            s->gpu_ns = pi2.gpu_energy.task_gpu_utilisation;
+            s->have_gpu = 1;
+#if defined(__arm64__) || defined(__arm__)
+            s->energy_nj = pi2.task_energy;     /* the field exists only on arm */
+            s->have_energy = 1;
+#endif
         }
     }
 #endif
@@ -363,6 +388,10 @@ static void cr_sample_take(struct cr_sample *s)
     s->total = 0;
     s->task_wakeups = 0;
     s->have_task_wakeups = 0;
+    s->gpu_ns = 0;
+    s->energy_nj = 0;
+    s->have_gpu = 0;
+    s->have_energy = 0;
     if (!hz) {
         hz = sysconf(_SC_CLK_TCK);
         if (hz <= 0)
@@ -541,6 +570,15 @@ static void cr_print(uint64_t window_us)
         uint64_t dw = s_cur.task_wakeups >= s_prev.task_wakeups
                           ? s_cur.task_wakeups - s_prev.task_wakeups : 0;
         cr_add(line, sizeof line, "; wakeups %.0f/s", w > 0 ? (double)dw * 1e6 / w : 0.0);
+    }
+    if (s_cur.have_gpu && s_prev.have_gpu) {
+        uint64_t dg = s_cur.gpu_ns >= s_prev.gpu_ns ? s_cur.gpu_ns - s_prev.gpu_ns : 0;
+        cr_add(line, sizeof line, "; gpu %.0f%%", w > 0 ? 100.0 * (double)dg / 1000.0 / w : 0.0);
+    }
+    if (s_cur.have_energy && s_prev.have_energy) {
+        uint64_t dn = s_cur.energy_nj >= s_prev.energy_nj ? s_cur.energy_nj - s_prev.energy_nj : 0;
+        /* 1 nJ per us = 1 mW */
+        cr_add(line, sizeof line, ", cpu energy %.0f mW", w > 0 ? (double)dn / w : 0.0);
     }
 
     th = s_thermal;

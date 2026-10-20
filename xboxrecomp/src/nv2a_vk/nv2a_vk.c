@@ -476,6 +476,8 @@ static void set_surface_scissor(const uint32_t *r, const VkSurf *s)
  * only (A/B dumps). */
 static int s_cl_mode = -1;
 static uint32_t s_cl_passes, s_cl_folded;   /* passes begun with a CLEAR load, clears folded */
+static uint64_t s_tile_ld, s_tile_st;   /* bytes a tile GPU loads at pass begin / stores at pass end (measurement) */
+static uint32_t s_tile_big;   /* passes at least 3/4 of the scaled 640x480 */
 
 static int clear_load_on(void)
 {
@@ -559,6 +561,30 @@ static void begin_rendering_c(VkSurf *s, VkDepthBuf *d, const BeginClear *bc)
         }
         if (any)
             s_cl_passes++;
+    }
+    {
+        /* Tile traffic a tile GPU pays for this pass. Every VkSurf is
+         * B8G8R8A8_UNORM: 4 bytes per pixel. */
+        uint64_t area = ri.renderArea.extent.width * (uint64_t)ri.renderArea.extent.height;
+        if (ca.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
+            s_tile_ld += area * 4;
+        s_tile_st += area * 4;
+        if (d) {
+            int ld = ri.pStencilAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+            if (s_depth_fmt == VK_FORMAT_D24_UNORM_S8_UINT) {
+                if (da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD || ld)
+                    s_tile_ld += area * 4;
+                s_tile_st += area * 4;
+            } else {
+                if (da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
+                    s_tile_ld += area * 4;
+                if (ld)
+                    s_tile_ld += area;
+                s_tile_st += area * 5;
+            }
+        }
+        if (area * 4 >= (uint64_t)(640.0 * 480.0 * s_scale * s_scale) * 3)
+            s_tile_big++;
     }
     p_begin_rendering(s_cb, &ri);
     s_in_render = 1;
@@ -5171,7 +5197,8 @@ static void vk_flip(void)
         s_inst_on = s_frame & 1;
     {
         static int st = -1;
-        static uint32_t st_frame, st_cl_passes, st_cl_folded, st_hoist, st_inline;
+        static uint32_t st_frame, st_cl_passes, st_cl_folded, st_hoist, st_inline, st_tile_big;
+        static uint64_t st_tile_ld, st_tile_st;
         if (st < 0) {
             const char *e = getenv("RECOMP_DRAW_STATS");
             st = e && *e == '1';
@@ -5186,10 +5213,17 @@ static void vk_flip(void)
                     (double)(s_cl_folded - st_cl_folded) / (s_frame - st_frame),
                     (double)(s_hoist_up - st_hoist) / (s_frame - st_frame),
                     (double)(s_inline_up - st_inline) / (s_frame - st_frame));
+            fprintf(stderr, "[vk] per frame: tile load %.1f MB, tile store %.1f MB, %.2f full-size passes\n",
+                    (double)(s_tile_ld - st_tile_ld) / 1048576.0 / (s_frame - st_frame),
+                    (double)(s_tile_st - st_tile_st) / 1048576.0 / (s_frame - st_frame),
+                    (double)(s_tile_big - st_tile_big) / (s_frame - st_frame));
             st_cl_passes = s_cl_passes;
             st_cl_folded = s_cl_folded;
             st_hoist = s_hoist_up;
             st_inline = s_inline_up;
+            st_tile_ld = s_tile_ld;
+            st_tile_st = s_tile_st;
+            st_tile_big = s_tile_big;
             s_st_draws = s_st_calls = s_st_inst = 0;
             st_frame = s_frame;
         }
@@ -5465,7 +5499,8 @@ static void vk_flip(void)
         /* Always-on 10 s line: where do the executor's flips go (submit
          * and present are where MoltenVK may wait for a drawable)? */
         static uint64_t win_start, sub_sum, sub_max, pre_sum, pre_max;
-        static uint32_t flips, npre, sub_base, reb_base, cl_p_base, cl_f_base, ho_base, in_base;
+        static uint32_t flips, npre, sub_base, reb_base, cl_p_base, cl_f_base, ho_base, in_base, tb_base;
+        static uint64_t tl_base, ts_base;
         uint64_t now = hz_now();
         if (!win_start) {
             win_start = now;
@@ -5501,15 +5536,22 @@ static void vk_flip(void)
                         "layout-split passes/frame %.1f, uploads/frame %.1f, upload KB/frame %.1f, "
                         "load-clear passes/frame %.1f, clears folded/frame %.1f, "
                         "hoisted uploads/frame %.1f, inline uploads/frame %.1f, "
-                        "mem left %llu MB\n",
+                        "mem left %llu MB, tile load %.1f MB/frame, tile store %.1f MB/frame, "
+                        "full-size passes/frame %.1f\n",
                         s_ios_passes / nf, s_ios_up_splits / nf, s_ios_lay_splits / nf,
                         s_ios_uploads / nf, s_ios_up_bytes / 1024.0 / nf,
                         (s_cl_passes - cl_p_base) / nf, (s_cl_folded - cl_f_base) / nf,
-                        (s_hoist_up - ho_base) / nf, (s_inline_up - in_base) / nf, mem_mb);
+                        (s_hoist_up - ho_base) / nf, (s_inline_up - in_base) / nf, mem_mb,
+                        (s_tile_ld - tl_base) / 1048576.0 / nf,
+                        (s_tile_st - ts_base) / 1048576.0 / nf,
+                        (s_tile_big - tb_base) / nf);
                 cl_p_base = s_cl_passes;
                 cl_f_base = s_cl_folded;
                 ho_base = s_hoist_up;
                 in_base = s_inline_up;
+                tl_base = s_tile_ld;
+                ts_base = s_tile_st;
+                tb_base = s_tile_big;
                 s_ios_passes = s_ios_up_splits = s_ios_lay_splits = s_ios_uploads = 0;
                 s_ios_up_bytes = 0;
             }
