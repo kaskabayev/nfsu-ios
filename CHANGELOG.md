@@ -1,10 +1,10 @@
 # Changelog
 
-Short notes per release of this fork. The upstream Switch and Linux port has
+Short notes per release of this project. The upstream Switch and Linux port has
 its own release history in [antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw);
 this tree is based on upstream version 0.5 (commit 6e19726) and includes
 upstream up to 0.5.13 (commit d3bbc30), except the renderer parts listed under
-"Not yet ported" below. Version numbers below are the fork's build tags.
+"Not yet ported" below. Version numbers below are this project's build tags.
 
 ## Not yet ported (upstream 0.5.12 and 0.5.13, Vulkan renderer)
 

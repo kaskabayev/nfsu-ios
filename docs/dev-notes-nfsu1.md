@@ -1,6 +1,6 @@
 # NFSU1 (Xbox Need for Speed: Underground) on the NFSU2 shell
 
-NFSU1 was brought up on a branch forked from the NFSU2 iOS tree at v29 and is
+NFSU1 was brought up on a branch made from the NFSU2 iOS tree at v29 and is
 now in the same tree (`games/nfsu1/`). The runtime, renderer and iOS shell are
 NFSU2's; only the title-specific parts changed. [dev-notes-nfsu2.md](dev-notes-nfsu2.md)
 describes NFSU2 and the shared runtime.

@@ -424,12 +424,12 @@ Licence facts:
 - The toolkit that sp00nznet publishes as `xboxrecomp` is MIT licensed
   (`xboxrecomp/LICENSE`). Some of its files come from xemu and are
   LGPL-2.1-or-later (`xboxrecomp/NOTICE`). The copy in this tree also holds
-  changes made by the upstream port and by this fork (for example the Vulkan
+  changes made by the upstream port and by this project (for example the Vulkan
   renderer in `xboxrecomp/src/nv2a_vk/`). The MIT label of the toolkit does not
   cover those changes. They keep the status of their authors. See
   [LICENSE-NOTES.md](LICENSE-NOTES.md).
-- The changes made in this fork are MIT licensed ([LICENSE](LICENSE)), to the
-  extent the fork's author can license them. Edits inside upstream files
+- The changes kaskabayev made in this repository are MIT licensed
+  ([LICENSE](LICENSE)), to the extent their author can license them. Edits inside upstream files
   cannot be licensed apart from the upstream code. See
   [LICENSE-NOTES.md](LICENSE-NOTES.md).
 - The licences of the third-party code inside the iOS app (SDL, glslang,

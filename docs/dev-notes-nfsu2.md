@@ -1,7 +1,7 @@
 # NFSU2 (Xbox) static recompilation — developer notes
 
 Xbox NTSC-U Need for Speed: Underground 2, lifted to C with xboxrecomp and
-built for Linux, Nintendo Switch (libnx NRO) and iOS. This tree is a fork of
+built for Linux, Nintendo Switch (libnx NRO) and iOS. This tree is based on
 https://github.com/antoxa2584x/nfsu2-sw (upstream `main` at 6e19726, 2026-10-06).
 The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 

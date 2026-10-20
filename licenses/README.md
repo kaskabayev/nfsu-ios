@@ -14,7 +14,7 @@ tag, the table says so.
 
 | Component | Version | Licence | Used for | Files |
 |---|---|---|---|---|
-| This project (kaskabayev fork): iOS port, NFSU1 port, unified build, runtime fixes | this repository, the commit named in the notices | MIT | the app | `nfsu-ios-MIT.txt` |
+| This project (kaskabayev): iOS port, NFSU1 port, unified build, runtime fixes | this repository, the commit named in the notices | MIT | the app | `nfsu-ios-MIT.txt` |
 | xboxrecomp ([sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp)): the runtime, the Xbox kernel layer and the renderers | vendored in `xboxrecomp/` | MIT | the runtime | `xboxrecomp-MIT.txt` |
 | xemu files in `xboxrecomp/src/apu/` and `xboxrecomp/src/nv2a/` ([xemu](https://github.com/xemu-project/xemu): espes, Jannik Vogel, Matt Borgerson) | vendored in `xboxrecomp/` | LGPL-2.1-or-later, **statically linked** (see the relink note below) | Xbox sound chip and GPU register code | `xemu-LGPL-2.1.txt` |
 | Upstream port ([antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw), Anton Artemov), commit 6e19726 | vendored (base of `src/` and of the renderer and APU work) | **No licence stated.** The upstream repository has no licence file. No licence is claimed or granted here for this code. | the base of the port | none |

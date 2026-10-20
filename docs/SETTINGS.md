@@ -4,7 +4,7 @@ Environment variables of the runtime. The text and the tables come from the
 README of the upstream project
 ([antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw), Anton
 Artemov, at 6e19726; the tree includes upstream up to 0.5.13) and were
-extended for this fork. Keys that start with
+extended for this project. Keys that start with
 `NFSU2_` apply to NFSU1 as well; the key names did not change. Most keys are for
 debugging. The defaults are the normal configuration.
 
