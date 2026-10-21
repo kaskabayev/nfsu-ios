@@ -28,8 +28,8 @@
 #define NFSU_IOS_DATA_FOLDERS       { "NFSU1-data", "game", "nfsu1", "NFSU1" }
 
 /* Launch screen and log banner. */
-#define NFSU_BUILD_TAG      "u1-7"
-#define NFSU_BUILD_NOTE     "u1-6 + upstream 0.5.13 merged: lifter fixes"
+#define NFSU_BUILD_TAG      "u1-8"
+#define NFSU_BUILD_NOTE     "u1-7 + native matrix multiply and ftol, bulk pushbuffer, NFSU2 v34g renderer"
 
 /* The disc this build expects. These values belong to the gen/ the binary was
  * built from (the XBE the lifter read), so they must change together with it:
@@ -45,11 +45,13 @@
  * ends with { NULL, NULL }. main.c sets each as an environment default, and
  * the settings panels show the same default (xbox_app_default_on). NFSU1:
  * 4:3 and no movie crop until both are checked for this title; the
- * upstream 0.5.13 renderer paths (bulk pushbuffer runs, per-axis vertex snap)
- * stay off until they are checked here. */
+ * per-axis vertex snap of upstream 0.5.13 stays off until it is checked
+ * here. The bulk pushbuffer runs (RECOMP_PB_RUN) are on: a Linux race looks
+ * the same with them and the executor's own pushbuffer work takes about 2 ms
+ * less per frame. Not measured on a device. RECOMP_PB_RUN=0 turns them off. */
 #define NFSU_ENV_DEFAULTS \
     { { "RECOMP_WIDESCREEN", "0" }, { "NFSU2_MOVIE_CROP", "0" }, \
-      { "RECOMP_PB_RUN", "0" }, { "RECOMP_VK_SNAP", "0" }, { NULL, NULL } }
+      { "RECOMP_PB_RUN", "1" }, { "RECOMP_VK_SNAP", "0" }, { NULL, NULL } }
 
 /* Hooks the title has. NFSU1's image has no .data float at 0x3A4C64 (outside
  * the image), and NFSU2's string-table patch does not apply. */

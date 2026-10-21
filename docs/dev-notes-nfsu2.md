@@ -136,6 +136,17 @@ older text below that says `src/recomp_manual.c` means
   traps through a lock handshake with the executor and reporting retired
   flips; `FLIP_STALL` waits for a retire (read != write); `DMA_GET` is
   published as the executor walks. Frame rate is now vblank-locked.
+- **Title-screen stall on Linux (open, 2026-10-21):** about 1 run in 12
+  (lavapipe, headless) stops flipping at the title, frame 2000-2800. The same
+  rate on v34f HEAD and on v34g. The main thread waits with no timeout in
+  `sub_002E8F20` (BlockOnFence; callers `sub_002E9530`, `sub_000AEA90`):
+  `KeWaitForSingleObject` on the event at `0x2F956C` (dev+0x1DCC), thunk call
+  at `0x2E9074`. The NOP(5) trap that sets it (PGRAPH handler `sub_002F22F0`
+  -> `sub_002F2080` case 5) never comes: PUT == GET, the last trap was a flip,
+  and the GPU fence is already past the waited fence. Not seen on the iPhone.
+  Proposed rescue (not applied): in `bridge_KeWaitForSingleObject`, for that
+  event with no timeout, wait in 4 ms slices and return when D3D's fence test
+  says the fence passed; log one line when it fires.
 - **Red races / black loading screen** (renderer, nv2a_gl): the race colour
   grade samples two LUTs with DEPENDENT_AR / DEPENDENT_GB texture modes
   (implemented in gl_psh.c, source stage from SHADER_OTHER_STAGE_INPUT), and

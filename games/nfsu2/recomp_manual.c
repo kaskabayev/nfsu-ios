@@ -971,6 +971,75 @@ void sub_00253AD5(void)
 
 static void unimpl_tick(void);
 
+/* ── 30 fps: a late frame waits for the next vblank ────────
+ *
+ * Present packs the interval at 0x2F76FC into the flip trap word as
+ * (bits << 5) | 1; bits 1/2/3 = 1/2/4 vblanks, 8 = immediate when late.
+ * 0x80000002 (D3DPRESENT_INTERVAL_TWO_OR_IMMEDIATE, the race 30 fps cap)
+ * sets the 8, plain 2 does not. The iOS display is FIFO and cannot tear:
+ * a late "immediate" flip still shows at the next vblank, and the flip
+ * after it, two vblanks after the late one, lands one vblank after it. One
+ * frame is then on screen for one refresh, a visible speed-up (v34f
+ * device log, 30 fps race: [pace] "on screen 1v" 14..31 per 10 s, [dt]
+ * "used 60" 14..29 per 10 s).
+ *
+ * With NFSU2_LATE_WAIT=1 the wrappers hand 2 to the generated swap instead
+ * of 0x80000002, so a late frame waits for the next vblank. 0x80000001 (the
+ * forced 60 fps path) and every other value stay as they are. The value is
+ * put back after the swap when the game left our 2 in place.
+ *
+ * Cost: on iOS each late frame now costs one whole refresh instead of a
+ * one-refresh catch-up frame.
+ *
+ * Default on for iOS, off elsewhere; NFSU2_LATE_WAIT=0 / 1 sets it. The
+ * slot value the wrappers see is logged when it changes, 16 lines at most:
+ *   [FPS] swap slot 0x80000002 */
+#if defined(__APPLE__) && (defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) || \
+                           defined(__IPHONE_OS_VERSION_MIN_REQUIRED__))
+#  define LATE_WAIT_DEFAULT 1
+#else
+#  define LATE_WAIT_DEFAULT 0
+#endif
+#define LATE_WAIT_LOG   16              /* slot value lines, at most */
+
+static int late_wait_wanted(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("NFSU2_LATE_WAIT");
+        v = LATE_WAIT_DEFAULT;
+        if (e && strcmp(e, "0") == 0)
+            v = 0;
+        else if (e && strcmp(e, "1") == 0)
+            v = 1;
+        fprintf(stderr, "[FPS] 30 fps: a late frame waits for the next vblank (NFSU2_LATE_WAIT)%s\n",
+                v ? "" : " off");
+    }
+    return v;
+}
+
+/* Runs one generated swap with the slot as above. */
+static void swap_gen(uint32_t slot, void (*gen)(void))
+{
+    static uint32_t last;
+    static unsigned logged;
+    int on = late_wait_wanted(), late = 0;
+    uint32_t cur = MEM32(slot);
+
+    if (logged < LATE_WAIT_LOG && (cur != last || !logged)) {
+        last = cur;
+        logged++;
+        fprintf(stderr, "[FPS] swap slot 0x%08X\n", cur);
+    }
+    if (on && cur == 0x80000002u) {
+        MEM32(slot) = 2u;
+        late = 1;
+    }
+    gen();
+    if (late && MEM32(slot) == 2u)
+        MEM32(slot) = 0x80000002u;
+}
+
 void sub_002EB4B0(void)
 {
     unimpl_tick();
@@ -978,7 +1047,7 @@ void sub_002EB4B0(void)
     load_swap(0x2F76FCu);
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
-    sub_002EB4B0_gen();
+    swap_gen(0x2F76FCu, sub_002EB4B0_gen);
 }
 
 void sub_002EB6A0(void)
@@ -988,7 +1057,7 @@ void sub_002EB6A0(void)
     load_swap(0x2F76FCu);
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
-    sub_002EB6A0_gen();
+    swap_gen(0x2F76FCu, sub_002EB6A0_gen);
 }
 
 /* ── D3D interrupt handlers at DISPATCH_LEVEL ────────────────

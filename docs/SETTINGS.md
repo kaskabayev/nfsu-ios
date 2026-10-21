@@ -57,6 +57,7 @@ RECOMP_WIDESCREEN=0
 | `NFSU2_APU=0` | With `RECOMP_AC97_READY=plain`: no emulated APU (no sound). |
 | `NFSU2_DT_SMOOTH=0` | NFSU2: the game's own time step in races and menus. By default the step is a whole number of 1/60 s (1 at 60 fps, 2 at 30 fps; the median of the last 8 frames) and the difference to the real time is paid back one 1/60 s at a time when it grows past 1.5 steps. Cutscenes and load stalls keep the real step; resuming from the pause menu does not move the race forward. |
 | `RECOMP_LOAD_FAST=0` | NFSU2: no 60 fps loading screens. By default, with `RECOMP_PRESENT_INTERVAL=0`, the swap interval is every refresh while a load runs (8 of the last 10 frames queued a read job) and goes back to the game's own value 10 frames after the last job. The game reads one block per frame, so the load takes about half the time. Not while the heat cap is on or in cutscenes, and not past 30 s in one stretch. One `[load] <s> s, <frames> frames, <kicks> loader kicks, fast on|off` line per load. |
+| `NFSU2_LATE_WAIT` | NFSU2: at 30 fps (the race cap, present interval `0x80000002`) a late frame waits for the next refresh instead of flipping at once: 1 on, 0 off. Default 1 on iOS, 0 elsewhere. The iOS display cannot tear, so an "immediate" late flip was shown at the next refresh anyway and the next frame then stayed on screen for one refresh only (a visible speed-up). Each late frame now costs one whole refresh. Prints `[FPS] swap slot 0x<value>` when the game's interval value changes (16 lines at most). |
 | `NFSU2_SIM_STEPS` | Longest game-time step per frame, in 1/60 s (default 6 = 100 ms; 3 = the original 50 ms cap, which slows races below 20 fps). |
 | `NFSU2_NATIVE_VP6` | Movie decoder: 1 = FFmpeg (default when built with it), 0 = the lifted decoder, 2 = both and compare. |
 | `NFSU2_MOVIE_FLASH=1` | Keep the opening trailer's white flash frames (shown black by default). |
@@ -104,8 +105,10 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_WORKERS=inline` | Run the title's worker routines inline instead of on threads. |
 | `RECOMP_ASYNC_IO=1` | Asynchronous NtReadFile. |
 | `RECOMP_CS_MODE=single` | Every guest critical section behind one recursive lock. |
-| `RECOMP_NATIVE=0` | Use the lifted culling functions instead of the native C versions. |
-| `RECOMP_NATIVE_CHECK=1` | Run both and report any difference. |
+| `RECOMP_NATIVE=0` | Use the lifted functions instead of the native C versions. NFSU2: the culling, matrix, ftol and math leaves. NFSU1: the 4x4 matrix multiply (sub_00169F4A) and _ftol2 (sub_001B2344). |
+| `RECOMP_NATIVE_CHECK=1` | Run both and report any difference: `[native] sub_XXXXXXXX: N calls, M mismatches`, and the first 20 mismatches. |
+| `NFSU1_NATIVE_MAT=0` | NFSU1: run the lifted 4x4 matrix multiply (sub_00169F4A) instead of the native one. |
+| `NFSU1_NATIVE_FTOL=0` | NFSU1: run the lifted _ftol2 (sub_001B2344) instead of the native one. |
 | `RECOMP_QUIET` | 1 = no periodic kernel/GPU summaries (Switch default), 0 = show them. |
 | `RECOMP_NO_LOG=1` | No `xbox_kernel.log`. |
 | `XBOX_LOG_LEVEL` | Kernel log level (0 errors … trace). |
@@ -133,9 +136,12 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_GL_FINISH=1` | Wait for the GPU after every operation (finds the call that hangs it). |
 | `RECOMP_FPS_LOG=1` | Presented frames per 10 s. |
 | `RECOMP_VK_CUBE=0` | Vulkan: no cube maps (car reflections off). The in-game Car Reflections row does the same at run time. |
+| `RECOMP_VK_CUBE_EAGER=0\|2` | Vulkan: copy changed cube-map faces when a draw samples the cube in the middle of a pass (the rule before v34g; the pass ends for the copy). By default the copy happens when the next pass begins on another target. 2 = on for odd frames only (A/B dumps). |
+| `RECOMP_VK_DEPTH_LAZY=0\|2` | Vulkan: every pass attaches the guest's depth buffer (the rule before v34g). By default a pass attaches depth only when a draw tests, writes or stencils it, or when the pass used depth the last time it ran. A pass that needs depth later restarts with it. 2 = on for odd frames only. |
+| `RECOMP_VK_CLEAR_DEFER=0\|2` | Vulkan: clear depth and stencil at once (the rule before v34g). By default a full depth/stencil clear that the next pass will not use stays pending and becomes the load op of the next pass that attaches the buffer. Needs `RECOMP_VK_DEPTH_LAZY`. 2 = on for odd frames only. |
 | `RECOMP_VK_SNAP=1\|0` | Vulkan vertex snap: 1 puts each position where a title edge there would land, per axis; 0 shifts both axes by one constant (the rule before 0.5.13). They differ at render scales of 2 and up. Default 1; 0 in NFSU1. |
 | `RECOMP_VK_ZCLAMP=1\|0` | Vulkan: 1 = the per-vertex depth clamp in the vertex shader (default on Switch, where the change is not tested; 0 drops it there). By default, with depthClamp on the device, z passes through and the pipeline clamps per fragment; the vertex clamp tilted the depth plane of triangles that cross the near plane (world walls flashed for a frame). Without depthClamp the vertex clamp is always used. The log line `[VK] vertex z:` shows the choice. For A/B. |
-| `RECOMP_PB_RUN=1\|0` | Take vertex-constant and index runs of the pushbuffer in one loop and skip the per-word survey. Default 1; 0 on iOS and in NFSU1. |
+| `RECOMP_PB_RUN=1\|0` | Take vertex-constant and index runs of the pushbuffer in one loop and skip the per-word survey. Default 1; 0 for NFSU2 on iOS. NFSU1 uses 1 on every platform. |
 | `RECOMP_VK_PACE=1\|0` | iOS, Vulkan: 1 = ask for each frame's present time (the next refresh on the 60 Hz grid that keeps the game's own rate), 0 (default) = only measure: the measurement showed no gain, pacing only added delay; kept for A/B. The `[pace]` line every 10 s counts frames by the refreshes they stayed on screen (`1v` .. `4+v`) and the `late` ones. |
 | `RECOMP_VK_PACE_MS=<ms>` | With `RECOMP_VK_PACE`: the least time between the game's frame and the refresh that shows it (default 12, 0..50). |
 | `RECOMP_DT_HIST=0` | NFSU2: no `[dt]` line. By default a `[dt]` line every 10 s gives the physics ticks per frame (min, max, average, the most common values) twice: `raw` is what the real frame time asks for, `used` is what the game ran after `NFSU2_DT_SMOOTH`. It also gives `debt fixes` (how often the smoothing paid back a 1/60 s) and the largest debt in ms. At 30 fps a steady 120 means even motion, a wide spread means the step varies from frame to frame. |

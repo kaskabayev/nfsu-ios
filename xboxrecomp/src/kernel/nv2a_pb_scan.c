@@ -344,7 +344,7 @@ void nv2a_pb_scan(uint32_t put_phys)
             for (uint32_t i = 0; i < count && s_get < PB_RAM_BYTES; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
-                if (!s_fast)
+                if (s_survey)           /* the inventory is printed under RECOMP_PB_SCAN only */
                     note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never

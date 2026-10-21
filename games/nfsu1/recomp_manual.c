@@ -793,3 +793,223 @@ void recomp_unimpl(const char *text, uint32_t va)
     }
     if (trap_cached) abort();
 }
+
+/* ── Native math leaves of the main thread ───────────────────
+ *
+ * Both are exact twins of NFSU2 natives (games/nfsu2/recomp_manual.c:
+ * sub_002213EA / sub_002EEA80 and sub_002A68EC). The lifted bodies keep
+ * every xmm register and x87 slot in thread-local storage, so each call
+ * costs many TLS accesses (Linux race profile: sub_00169F4A 22.8% of the
+ * main thread, sub_001B2344 2.1%). Each native leaves the same registers
+ * and frame as the lifted body (listed at each function); the stack bytes
+ * the lifted body uses as scratch below esp and the popped x87 slots are
+ * dead after the return and are not written.
+ *
+ * Switches (read once):
+ *   RECOMP_NATIVE=0        both lifted (the NFSU2 switch)
+ *   NFSU1_NATIVE_MAT=0     sub_00169F4A lifted
+ *   NFSU1_NATIVE_FTOL=0    sub_001B2344 lifted
+ *   RECOMP_NATIVE_CHECK=1  run native and lifted, compare outputs and every
+ *                          register the lifted body writes, report
+ *                          "[native] sub_...: N calls, M mismatches" */
+static int nfsu1_native_mode(const char *own)
+{
+    const char *e = getenv("RECOMP_NATIVE"), *o = getenv(own), *c = getenv("RECOMP_NATIVE_CHECK");
+    if ((e && *e == '0') || (o && *o == '0'))
+        return 0;
+    return (c && *c == '1') ? 2 : 1;
+}
+
+static void native_report(const char *name, unsigned long *calls, unsigned long *bad, int ok,
+                          uint32_t a0, uint32_t a1, uint32_t a2)
+{
+    ++*calls;
+    if (!ok && (*bad)++ < 20)
+        fprintf(stderr, "[native] %s mismatch: args %08X %08X %08X\n", name, a0, a1, a2);
+    if ((*calls & 0xFFFFF) == 0 || *calls == 4096)
+        fprintf(stderr, "[native] %s: %lu calls, %lu mismatches\n", name, *calls, *bad);
+}
+
+/* sub_00169F4A: SSE 4x4 multiply, stdcall (out, a, b), ret 12: out = a * b,
+ * row-major floats; row i = a[i][0] * b row 0 + ... + a[i][3] * b row 3,
+ * summed ((p0 + p1) + p2) + p3 (shufps / mulps / addps), no FMA
+ * contraction. The loads all come before the stores, so out may alias a or
+ * b. Leaves (as the lifted body does): the result rows in xmm2..xmm5,
+ * a[3][2] * b row 2 in xmm0, a[3][3] * b row 3 in xmm1, eax = ecx = out
+ * (not a: the D3D twin sub_002EEA80 leaves eax = a), esp += 16. No flags,
+ * edx and ebp untouched. */
+extern void sub_00169F4A_gen(void);
+
+__attribute__((optimize("fp-contract=off")))
+static void mat4_mul(float *o, const float *a, const float *b)
+{
+    float r[16];
+    int i, k;
+    for (i = 0; i < 4; i++)
+        for (k = 0; k < 4; k++) {
+            float s = a[4 * i] * b[k];
+            s = s + a[4 * i + 1] * b[4 + k];
+            s = s + a[4 * i + 2] * b[8 + k];
+            s = s + a[4 * i + 3] * b[12 + k];
+            r[4 * i + k] = s;
+        }
+    memcpy(o, r, sizeof r);
+}
+
+__attribute__((optimize("fp-contract=off")))
+static void mat4_mul_xmm(uint32_t a, uint32_t b, RecompXmm x[6])
+{
+    float ma[16], mb[16], o[16];
+    int k;
+    memcpy(ma, (const void *)XBOX_PTR(a), 64);
+    memcpy(mb, (const void *)XBOX_PTR(b), 64);
+    mat4_mul(o, ma, mb);
+    for (k = 0; k < 4; k++) {
+        x[0].f[k] = ma[14] * mb[8 + k];
+        x[1].f[k] = ma[15] * mb[12 + k];
+    }
+    memcpy(&x[2], o, 64);
+}
+
+void sub_00169F4A(void)
+{
+    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
+    uint32_t e0 = esp, out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 12);
+    RecompXmm x[6];
+
+    if (__builtin_expect(mode < 0, 0))
+        mode = nfsu1_native_mode("NFSU1_NATIVE_MAT");
+    if (__builtin_expect(mode == 0, 0)) {
+        sub_00169F4A_gen();
+        return;
+    }
+    mat4_mul_xmm(a, b, x);              /* before the lifted run: out may alias a or b */
+    if (__builtin_expect(mode == 2, 0)) {
+        static unsigned long calls, bad;
+        uint32_t sv_edx = edx;
+        sub_00169F4A_gen();
+        native_report("sub_00169F4A", &calls, &bad,
+                      !memcmp(&x[2], (const void *)XBOX_PTR(out), 64) && eax == out && ecx == out
+                      && edx == sv_edx
+                      && !memcmp(&x[0], &g_xmm0, 16) && !memcmp(&x[1], &g_xmm1, 16)
+                      && !memcmp(&x[2], &g_xmm2, 16) && !memcmp(&x[3], &g_xmm3, 16)
+                      && !memcmp(&x[4], &g_xmm4, 16) && !memcmp(&x[5], &g_xmm5, 16)
+                      && esp == e0 + 16u, out, a, b);
+        return;
+    }
+    memcpy((void *)XBOX_PTR(out), &x[2], 64);
+    g_xmm0 = x[0]; g_xmm1 = x[1]; g_xmm2 = x[2];
+    g_xmm3 = x[3]; g_xmm4 = x[4]; g_xmm5 = x[5];
+    eax = out;
+    ecx = out;
+    esp += 16;                          /* return address + three arguments */
+}
+
+/* sub_001B2344: MSVC CRT _ftol2 (the same routine as NFSU2's sub_002A68EC):
+ * st(0) truncated to a 64-bit integer in edx:eax, popped. It rounds with
+ * fistp (the control word's mode), then corrects towards zero by the sign
+ * of the float (x - r): x >= 0 and x - r < 0 -> r - 1; x < 0 and x - r > 0
+ * -> r + 1. r == 0 or the integer indefinite is returned as is (ecx
+ * untouched). When the low word is 0 the lifted body takes the sign from
+ * the high word of r instead of the float: the same sign wherever it gets
+ * that far (r != 0). Leaves eax, edx, ecx (the correction), the x87 top
+ * advanced by one, esp += 4 and the frame its push ebp / mov ebp, esp
+ * published (g_ebp = g_seh_ebp = esp - 4 at entry). No flags escape. */
+extern void sub_001B2344_gen(void);
+
+__attribute__((noinline, cold)) static int64_t ftol_fist_slow(double x, uint16_t cw)
+{
+    return recomp_fist(x, cw, 64);
+}
+
+static inline int64_t ftol_fist(double x, uint16_t cw)
+{
+    if (__builtin_expect(((cw >> 10) & 3u) == 0 && fabs(x) < 0x1p63, 1))
+        return (int64_t)rint(x);        /* host rounding is never changed: nearest */
+    return ftol_fist_slow(x, cw);       /* other modes, NaN, out of range */
+}
+
+static inline void ftol2_native(double x, uint32_t *peax, uint32_t *pedx, uint32_t *pecx)
+{
+    int64_t r = ftol_fist(x, g_fp_control_word);
+    uint32_t lo = (uint32_t)r, hi = (uint32_t)((uint64_t)r >> 32), d;
+    float fx = (float)x, fd;
+    uint32_t sx;
+
+    if (lo == 0 && (hi & 0x7FFFFFFFu) == 0) {   /* 0 or the indefinite */
+        *peax = lo;
+        *pedx = hi;
+        return;
+    }
+    fd = (float)(x - (double)r);
+    memcpy(&d, &fd, 4);
+    memcpy(&sx, &fx, 4);
+    if (sx & 0x80000000u) {
+        d ^= 0x80000000u;
+        r += d >= 0x80000001u;          /* carry of d + 0x7FFFFFFF */
+    } else {
+        r -= d >= 0x80000001u;          /* borrow */
+    }
+    *peax = (uint32_t)r;
+    *pedx = (uint32_t)((uint64_t)r >> 32);
+    *pecx = d + 0x7FFFFFFFu;
+}
+
+static int s_ftol_mode = -1;            /* 0 lifted, 1 native, 2 native + check */
+
+/* Modes other than plain native, out of line so that the hot path below stays
+ * small enough to inline into its callers. */
+__attribute__((noinline, cold)) static void ftol2_slow(void)
+{
+    double x = g_fp_stack[g_fp_top & 7];
+    uint32_t a, d, c = ecx, frame = esp - 4u;
+
+    if (s_ftol_mode < 0)
+        s_ftol_mode = nfsu1_native_mode("NFSU1_NATIVE_FTOL");
+    if (s_ftol_mode == 0) {
+        sub_001B2344_gen();
+        return;
+    }
+    ftol2_native(x, &a, &d, &c);
+    if (s_ftol_mode == 2) {
+        static unsigned long calls, bad;
+        int top = (g_fp_top + 1) & 7;
+        uint32_t sp = esp + 4u;
+        sub_001B2344_gen();
+        calls++;
+        if ((eax != a || edx != d || ecx != c || g_fp_top != top || esp != sp
+             || g_ebp != frame || g_seh_ebp != frame) && bad++ < 20)
+            fprintf(stderr, "[native] sub_001B2344 mismatch for %.17g: lifted %08X:%08X "
+                    "ecx %08X, native %08X:%08X ecx %08X\n", x, edx, eax, ecx, d, a, c);
+        if ((calls & 0xFFFFF) == 0 || calls == 4096)
+            fprintf(stderr, "[native] sub_001B2344: %lu calls, %lu mismatches\n", calls, bad);
+        return;
+    }
+    eax = a;
+    edx = d;
+    ecx = c;
+    g_fp_top = (g_fp_top + 1) & 7;
+    g_ebp = g_seh_ebp = frame;
+    esp += 4;
+}
+
+inline void sub_001B2344(void)
+{
+    uint32_t a, d, c, frame;
+    int top;
+
+    if (__builtin_expect(s_ftol_mode != 1, 0)) {
+        ftol2_slow();                   /* first call, lifted or check mode */
+        return;
+    }
+    top = g_fp_top;
+    c = ecx;
+    frame = esp - 4u;
+    ftol2_native(g_fp_stack[top & 7], &a, &d, &c);
+    eax = a;
+    edx = d;
+    ecx = c;
+    g_fp_top = (top + 1) & 7;
+    g_ebp = g_seh_ebp = frame;          /* as its push ebp / mov ebp, esp left them */
+    esp += 4;                           /* return address */
+}

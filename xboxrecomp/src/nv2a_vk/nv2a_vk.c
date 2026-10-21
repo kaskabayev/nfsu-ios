@@ -371,6 +371,9 @@ typedef struct {
     uint32_t va, pw, ph;
     VkImage image; VkImageView view; VkDeviceMemory mem;
     uint32_t used;
+    int      pend_z, pend_st;  /* RECOMP_VK_CLEAR_DEFER: a full clear not yet done; the next pass that attaches this buffer clears */
+    float    z;
+    uint32_t st;
 } VkDepthBuf;
 
 #define VK_MAX_SURF 32
@@ -425,9 +428,110 @@ static void barrier_all(void)
         s_surf[i].dirty = 0;
 }
 
+/* Tile traffic of a pass is the colour and depth it loads and stores, so
+ * three switches cut the passes and the depth they carry. Each one: unset =
+ * on, 0 = off, 2 = on for odd s_frame only (A/B dumps).
+ *
+ *   RECOMP_VK_CUBE_EAGER   a cube map's faces are copied into it when the
+ *                          next pass begins on another target, not when a
+ *                          draw samples the cube in the middle of a pass
+ *                          (cube_from_surfaces must end the pass for the blit)
+ *   RECOMP_VK_DEPTH_LAZY   a pass attaches the guest's depth only when a draw
+ *                          tests, writes or stencils it. Most of a frame's
+ *                          small passes (rain drops, post effects) never do.
+ *   RECOMP_VK_CLEAR_DEFER  a full depth/stencil clear the next pass would not
+ *                          use stays pending on the depth buffer and becomes
+ *                          the load op of the next pass that attaches it
+ *
+ * Nothing but a pass reads or writes a VkDepthBuf (no sampling, no copy, no
+ * read-back), so a pending clear needs no flush on any other path. */
+static int s_ce_mode = -1, s_dl_mode = -1, s_cd_mode = -1;
+
+static int pass_sw(const char *name, const char *what)
+{
+    const char *e = getenv(name);
+    int m = e && *e ? (*e == '2' ? 2 : *e != '0') : 1;
+    fprintf(stderr, "  [VK] %s: %s (%s)\n", what, m == 2 ? "alternate per frame" : m ? "on" : "off", name);
+    return m;
+}
+
+static void pass_modes(void)
+{
+    if (s_ce_mode >= 0)
+        return;
+    s_ce_mode = pass_sw("RECOMP_VK_CUBE_EAGER", "eager cube refresh");
+    s_dl_mode = pass_sw("RECOMP_VK_DEPTH_LAZY", "lazy depth attachment");
+    s_cd_mode = pass_sw("RECOMP_VK_CLEAR_DEFER", "deferred depth clear");
+}
+static int cube_eager_on(void) { pass_modes(); return s_ce_mode == 2 ? (int)(s_frame & 1) : s_ce_mode; }
+static int depth_lazy_on(void) { pass_modes(); return s_dl_mode == 2 ? (int)(s_frame & 1) : s_dl_mode; }
+static int clear_defer_on(void) { pass_modes(); return s_cd_mode == 2 ? (int)(s_frame & 1) : s_cd_mode; }
+
+/* What the open pass is, for the depth predictor. A pass is keyed by its
+ * colour surface, the guest's depth and the colour surface of the pass
+ * before it in the frame: the main buffer alternates between two addresses
+ * and the rain adds a varying number of passes, so ordinals would not hold.
+ * Each key counts (3 = used depth last time) how many passes in a row left
+ * it unused; only a key with 0 starts without depth. An unknown key gets
+ * depth, as before. A depth restart (a draw needed what the pass left off)
+ * goes on as the same pass: same key, used. */
+typedef struct { uint32_t col, dep, prev; int n; } DepthPred;
+#define DL_SETS 128
+#define DL_WAYS 4
+static DepthPred s_dlp[DL_SETS][DL_WAYS];
+static uint32_t  s_last_col;            /* colour va of the last pass begun this frame */
+static uint32_t  s_pass_cva, s_pass_dva, s_pass_prev;   /* key of the open pass; dva 0: not tracked */
+static int       s_pass_used;           /* a draw of the open pass tested, wrote or stenciled depth */
+static uint32_t  s_dl_nodepth, s_dl_restarts, s_ce_refresh;   /* statistics */
+
+/* The entry of a key, or NULL. With make, a free way or else a way picked
+ * by the hash is taken over (n -1: nothing learned yet). Surface addresses share
+ * their low bits, so the key is mixed first. */
+static DepthPred *dl_find(uint32_t col, uint32_t dep, uint32_t prev, int make)
+{
+    uint32_t h = col * 0x9E3779B1u ^ (dep * 0x85EBCA6Bu + 0x1234567u) ^ (prev * 0xC2B2AE35u + 0x7654321u), w;
+    DepthPred *set;
+
+    h ^= h >> 15;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 13;
+    set = s_dlp[h % DL_SETS];
+    for (w = 0; w < DL_WAYS; w++)
+        if (set[w].col == col && set[w].dep == dep && set[w].prev == prev)
+            return &set[w];
+    if (!make)
+        return NULL;
+    for (w = 0; w < DL_WAYS && set[w].col; w++) { }
+    if (w == DL_WAYS)
+        w = (h >> 24) % DL_WAYS;
+    set[w].col = col; set[w].dep = dep; set[w].prev = prev;
+    set[w].n = -1;
+    return &set[w];
+}
+
+static int dl_wants_depth(uint32_t col, uint32_t dep, uint32_t prev)
+{
+    const DepthPred *p = dl_find(col, dep, prev, 0);
+    return !(p && p->n == 0);
+}
+
+static void dl_learn(uint32_t col, uint32_t dep, uint32_t prev, int used)
+{
+    DepthPred *p = dl_find(col, dep, prev, 1);
+    if (p->n < 0)
+        p->n = used ? 3 : 2;
+    else if (used)
+        p->n = 3;
+    else if (p->n > 0)
+        p->n--;
+}
+
 static void end_rendering(void)
 {
     if (s_in_render) {
+        if (s_pass_dva)
+            dl_learn(s_pass_cva, s_pass_dva, s_pass_prev, s_pass_used);
+        s_pass_dva = 0;
         p_end_rendering(s_cb);
         s_in_render = 0;
     }
@@ -500,15 +604,36 @@ typedef struct {
     uint32_t st;
 } BeginClear;
 
+static void cube_refresh_eager(const VkSurf *next);
+
+/* pass_depth's answer for the pass that begins next (it is for surface
+ * s_dl_for; begin_rendering_c takes it and clears it). */
+static VkSurf     *s_dl_for;
+static VkDepthBuf *s_dl_skip;           /* the guest's depth the pass starts without */
+static int         s_dl_restart;        /* the pass goes on, with depth */
+
 static void begin_rendering_c(VkSurf *s, VkDepthBuf *d, const BeginClear *bc)
 {
     VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingAttachmentInfo da = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingAttachmentInfo sa = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    BeginClear bcp;
+    VkDepthBuf *skip = NULL;
+    int restart = 0;
 
-    if (s_in_render && s_rt == s && s_rt_depth == d)
+    if (s_in_render && s_rt == s && s_rt_depth == d) {
+        s_dl_for = NULL;
         return;
+    }
+    if (s_dl_for == s) {
+        restart = s_dl_restart;
+        if (!d)
+            skip = s_dl_skip;
+    }
+    s_dl_for = NULL;
+    if (restart)
+        s_pass_dva = 0;                 /* the depth-less half teaches the predictor nothing */
 #ifdef NFSU2_IOS
     s_ios_passes++;
     if (s_ios_split_by == 1) s_ios_up_splits++;
@@ -516,6 +641,8 @@ static void begin_rendering_c(VkSurf *s, VkDepthBuf *d, const BeginClear *bc)
     s_ios_split_by = 0;
 #endif
     end_rendering();
+    if (cube_eager_on())
+        cube_refresh_eager(s);
     barrier_all();
     ca.imageView = s->view;
     ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -538,6 +665,19 @@ static void begin_rendering_c(VkSurf *s, VkDepthBuf *d, const BeginClear *bc)
         ri.pDepthAttachment = &da;
         ri.pStencilAttachment = &da;
     }
+    if (d && (d->pend_z || d->pend_st)) {
+        /* A deferred clear (vk_clear) lands in this pass; an explicit one
+         * of the same aspect is the later and wins. */
+        if (bc)
+            bcp = *bc;
+        else
+            memset(&bcp, 0, sizeof bcp);
+        if (!bcp.depth && d->pend_z) { bcp.depth = 1; bcp.z = d->z; }
+        if (!bcp.stencil && d->pend_st) { bcp.stencil = 1; bcp.st = d->st; }
+        bc = &bcp;
+    }
+    if (d)
+        d->pend_z = d->pend_st = 0;
     if (bc) {
         int any = 0;
         if (bc->color) {
@@ -590,12 +730,54 @@ static void begin_rendering_c(VkSurf *s, VkDepthBuf *d, const BeginClear *bc)
     s_in_render = 1;
     s_rt = s;
     s_rt_depth = d;
+    if (!restart)
+        s_pass_prev = s_last_col;
+    s_last_col = s->va;
+    s_pass_cva = s->va;
+    s_pass_dva = d ? d->va : skip ? skip->va : 0;
+    s_pass_used = restart;
+    if (skip)
+        s_dl_nodepth++;
+    if (restart)
+        s_dl_restarts++;
     set_viewport(s->pw, s->ph);
 }
 
 static void begin_rendering(VkSurf *s, VkDepthBuf *d)
 {
     begin_rendering_c(s, d, NULL);
+}
+
+/* The depth to attach for a draw or clear on s whose guest depth is gd
+ * (NULL: zeta 0); need: it tests, writes or stencils it, or clears it.
+ * Without RECOMP_VK_DEPTH_LAZY that is gd. Otherwise:
+ *  - a pass with depth stays as it is while the draw's depth is its own or
+ *    none (a zeta-0 draw runs with the depth tests off: vk_draw_raw);
+ *  - a pass without depth stays that way unless the draw needs it, which
+ *    restarts the pass with depth (LOAD: nothing wrote the buffer);
+ *  - a new pass attaches depth if the draw needs it or the predictor says
+ *    this pass used it last time. */
+static VkDepthBuf *pass_depth(VkSurf *s, VkDepthBuf *gd, int need)
+{
+    s_dl_for = s;
+    s_dl_skip = NULL;
+    s_dl_restart = 0;
+    if (!depth_lazy_on())
+        return gd;
+    if (s_in_render && s_rt == s) {
+        if (s_rt_depth && (!gd || gd == s_rt_depth))
+            return s_rt_depth;
+        if (!s_rt_depth && (!gd || !need))
+            return NULL;
+        if (!s_rt_depth && s_pass_dva == gd->va)
+            s_dl_restart = 1;
+    }
+    if (!gd)
+        return NULL;
+    if (need || dl_wants_depth(s->va, gd->va, s_last_col))
+        return gd;
+    s_dl_skip = gd;
+    return NULL;
 }
 
 /* An image in GENERAL layout, from UNDEFINED; recorded outside rendering. */
@@ -1510,12 +1692,85 @@ typedef struct {
 #define VK_MAX_CUBE 4
 static VkCube s_cube[VK_MAX_CUBE];
 
+/* Copy the faces that changed since the last copy into c; the number of
+ * faces copied. Ends the pass. */
+static int cube_blit_faces(VkCube *c, VkSurf *faces[6])
+{
+    uint32_t f;
+    int copied = 0;
+
+    for (f = 0; f < 6; f++) {
+        VkSurf *sf = faces[f];
+        VkImageBlit bl;
+        if (!sf || (c->src[f] == sf && c->gen[f] == sf->gen))
+            continue;
+        if (!copied) {
+            end_rendering();
+            barrier_all();
+        }
+        copied++;
+        memset(&bl, 0, sizeof bl);
+        bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bl.srcSubresource.layerCount = 1;
+        bl.srcOffsets[1].x = (int32_t)to_stored(c->w, sf->pw, sf->w);
+        bl.srcOffsets[1].y = (int32_t)to_stored(c->h, sf->ph, sf->h);
+        bl.srcOffsets[1].z = 1;
+        bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bl.dstSubresource.baseArrayLayer = f;
+        bl.dstSubresource.layerCount = 1;
+        bl.dstOffsets[1].x = (int32_t)c->size;
+        bl.dstOffsets[1].y = (int32_t)c->size;
+        bl.dstOffsets[1].z = 1;
+        vkCmdBlitImage(s_cb, sf->image, VK_IMAGE_LAYOUT_GENERAL, c->image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+        c->src[f] = sf;
+        c->gen[f] = sf->gen;
+    }
+    if (copied)
+        barrier_all();
+    return copied;
+}
+
+/* RECOMP_VK_CUBE_EAGER, from begin_rendering_c with no pass open: bring the
+ * cubes sampled this or the last frame up to date before a pass begins on
+ * next. A draw that samples a cube mid-pass then finds it current, and the
+ * pass goes on. Nothing is copied while next is one of a cube's faces (more
+ * faces are coming), and a face is copied only if cube_from_surfaces would
+ * take the same one with the same size; a face drawn again after the copy
+ * has another gen, and the lazy path copies it as before. */
+static void cube_refresh_eager(const VkSurf *next)
+{
+    int i;
+
+    for (i = 0; i < VK_MAX_CUBE; i++) {
+        VkCube *c = &s_cube[i];
+        VkSurf *faces[6];
+        uint32_t f, size = 0;
+        int stale = 0, own = 0;
+
+        if (!c->image || s_frame - c->used > 1)
+            continue;
+        for (f = 0; f < 6; f++) {
+            VkSurf *sf = surf_find(c->va + f * c->face);
+            faces[f] = sf;
+            if (!sf)
+                continue;
+            own |= sf == next;
+            if (to_stored(c->w, sf->pw, sf->w) > size)
+                size = to_stored(c->w, sf->pw, sf->w);
+            stale |= c->src[f] != sf || c->gen[f] != sf->gen;
+        }
+        if (stale && !own && size == c->size && cube_blit_faces(c, faces))
+            s_ce_refresh++;
+    }
+}
+
 static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint32_t face,
                                       VkSurf *faces[6])
 {
     VkCube *c = NULL;
     uint32_t f, size = 0;
-    int i, copied = 0;
+    int i;
 
     for (f = 0; f < 6; f++)
         if (faces[f] && to_stored(w, faces[f]->pw, faces[f]->w) > size)
@@ -1545,35 +1800,7 @@ static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint3
             LOGE("cube 0x%08X %ux%u from surfaces (stored %u)\n", va, w, h, size);
     }
     c->used = s_frame;
-    for (f = 0; f < 6; f++) {
-        VkSurf *sf = faces[f];
-        VkImageBlit bl;
-        if (!sf || (c->src[f] == sf && c->gen[f] == sf->gen))
-            continue;
-        if (!copied) {
-            end_rendering();
-            barrier_all();
-            copied = 1;
-        }
-        memset(&bl, 0, sizeof bl);
-        bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        bl.srcSubresource.layerCount = 1;
-        bl.srcOffsets[1].x = (int32_t)to_stored(w, sf->pw, sf->w);
-        bl.srcOffsets[1].y = (int32_t)to_stored(h, sf->ph, sf->h);
-        bl.srcOffsets[1].z = 1;
-        bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        bl.dstSubresource.baseArrayLayer = f;
-        bl.dstSubresource.layerCount = 1;
-        bl.dstOffsets[1].x = (int32_t)size;
-        bl.dstOffsets[1].y = (int32_t)size;
-        bl.dstOffsets[1].z = 1;
-        vkCmdBlitImage(s_cb, sf->image, VK_IMAGE_LAYOUT_GENERAL, c->image,
-                       VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
-        c->src[f] = sf;
-        c->gen[f] = sf->gen;
-    }
-    if (copied)
-        barrier_all();
+    cube_blit_faces(c, faces);
     return c->view;
 }
 
@@ -3929,6 +4156,7 @@ static int ready_impl(void)
     clear_image_color(s_dummy_cube_img, 0, 0, 0, 0);
     s_state = 1;
     mip_cfg_init();
+    pass_modes();
     fprintf(stderr, "  [VK] ready%s: BC %s, depth %s, depth clamp %s, UBO align %u\n",
             s_headless ? " (headless)" : "", s_have_bc ? "yes" : "no",
             s_depth_fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8",
@@ -4720,7 +4948,7 @@ static int pend_append(const Nv2aRawBatch *b, int changed)
 static void vk_draw_raw(const Nv2aRawBatch *b)
 {
     VkSurf *s, *sampled[4];
-    VkDepthBuf *d;
+    VkDepthBuf *d, *dp;
     VkProg *p;
     Nv2aPshKey pk;
     const uint32_t *r = b->regs;
@@ -4734,6 +4962,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     VkDescriptorBufferInfo ub[3];
     VkWriteDescriptorSet wr[7];
     uint32_t inst_room = 0;
+    int need;
     void *map;
     static VkPipeline cur_pipe;
     static uint32_t cur_pipe_gen;
@@ -4814,7 +5043,12 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         if (cm & 0x01000000u) m |= VK_COLOR_COMPONENT_A_BIT;
         key.cmask = m;
     }
-    key.depth = d != NULL;
+    /* dp: the depth the pass has (the guest's d, unless RECOMP_VK_DEPTH_LAZY
+     * leaves it off or keeps a pass's own for a zeta-0 draw). The pipeline
+     * must match the pass's attachments. */
+    need = d && (r[0x30C / 4] || r[0x35C / 4] || r[0x32C / 4]);   /* as apply_dynamic */
+    dp = pass_depth(s, d, need);
+    key.depth = dp != NULL;
     key.topo = cls;
     /* ALWAYS: upload_vertices() reuses s_vl_* on both paths, and the dynamic
      * path needs real descriptions too (they were zero before this fix). */
@@ -4842,7 +5076,9 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             s_f->ring_off = 0;
         }
     }
-    begin_rendering(s, d);
+    begin_rendering(s, dp);
+    if (dp && need)
+        s_pass_used = 1;
     s->dirty = 1;
     s->gen++;
     if (pipe != cur_pipe || cur_pipe_gen != s_cb_gen) {
@@ -4856,7 +5092,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
          * undefined after each new bind (the one-triangle-wedge bug). */
         s_dyn_valid = 0;
     }
-    apply_dynamic(r, d != NULL, topo);
+    apply_dynamic(r, d != NULL && dp == d, topo);
     set_surface_scissor(r, s);
 
     /* Uniforms. */
@@ -4992,9 +5228,11 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
 {
     VkSurf *s;
     VkDepthBuf *d;
+    VkDepthBuf *dp;
     VkClearAttachment ca[2];
     VkClearRect rect;
     uint32_t nca = 0;
+    int need, covers;
 
     if (!ready())
         return;
@@ -5048,10 +5286,29 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         return;
     VT("clear %08X %ux%u flags %X rect %d,%d %ux%u depth %p\n", s->va, s->pw, s->ph, flags,
        rect.rect.offset.x, rect.rect.offset.y, rect.rect.extent.width, rect.rect.extent.height, (void *)d);
+    /* The pass this clear belongs to has no depth, and the clear covers the
+     * whole depth buffer: RECOMP_VK_CLEAR_DEFER keeps it pending on the
+     * buffer (the next pass that attaches it clears as its load op). A new
+     * pass with a colour part defers only where the predictor says the pass
+     * will not use depth; a clear of depth alone opens nothing, so it always
+     * can. */
+    need = d && (flags & 0x3);
+    covers = need && rect.rect.offset.x == 0 && rect.rect.offset.y == 0 &&
+             rect.rect.extent.width == d->pw && rect.rect.extent.height == d->ph;
+    if (covers && clear_defer_on() && depth_lazy_on() && !(s_in_render && s_rt_depth == d) &&
+        (nca == 1 || (s_in_render && s_rt == s) || !dl_wants_depth(s->va, d->va, s_last_col))) {
+        if (flags & 1) { d->pend_z = 1; d->z = ca[nca - 1].clearValue.depthStencil.depth; }
+        if (flags & 2) { d->pend_st = 1; d->st = ca[nca - 1].clearValue.depthStencil.stencil; }
+        nca--;                          /* the depth entry is the last */
+        need = 0;
+        if (!nca)
+            return;                     /* nothing drawn into the colour surface */
+    }
+    dp = pass_depth(s, d, need);
     /* A clear that opens a new pass and covers its whole render area becomes
      * the pass's load op: every aspect in ca[] (full colour, depth, stencil)
      * folds, so no vkCmdClearAttachments is left. */
-    if (clear_load_on() && !(s_in_render && s_rt == s && s_rt_depth == d)) {
+    if (nca && clear_load_on() && !(s_in_render && s_rt == s && s_rt_depth == dp)) {
         uint32_t rw = s->pw, rh = s->ph, i;
         if (d && d->pw < rw) rw = d->pw;
         if (d && d->ph < rh) rh = d->ph;
@@ -5070,13 +5327,13 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                     bc.st = ca[i].clearValue.depthStencil.stencil;
                 }
             }
-            begin_rendering_c(s, d, &bc);
+            begin_rendering_c(s, dp, &bc);
             s_cl_folded++;
             nca = 0;
         }
     }
     if (nca) {
-        begin_rendering(s, d);
+        begin_rendering(s, dp);
         vkCmdClearAttachments(s_cb, nca, ca, 1, &rect);
     }
     VT("  cleared\n");
@@ -5198,6 +5455,7 @@ static void vk_flip(void)
     {
         static int st = -1;
         static uint32_t st_frame, st_cl_passes, st_cl_folded, st_hoist, st_inline, st_tile_big;
+        static uint32_t st_dl_nodepth, st_dl_restarts, st_ce_refresh;
         static uint64_t st_tile_ld, st_tile_st;
         if (st < 0) {
             const char *e = getenv("RECOMP_DRAW_STATS");
@@ -5213,10 +5471,14 @@ static void vk_flip(void)
                     (double)(s_cl_folded - st_cl_folded) / (s_frame - st_frame),
                     (double)(s_hoist_up - st_hoist) / (s_frame - st_frame),
                     (double)(s_inline_up - st_inline) / (s_frame - st_frame));
-            fprintf(stderr, "[vk] per frame: tile load %.1f MB, tile store %.1f MB, %.2f full-size passes\n",
+            fprintf(stderr, "[vk] per frame: tile load %.1f MB, tile store %.1f MB, %.2f full-size passes, "
+                    "%.2f passes without depth although zeta set, %.2f depth restarts, %.2f cube refreshes\n",
                     (double)(s_tile_ld - st_tile_ld) / 1048576.0 / (s_frame - st_frame),
                     (double)(s_tile_st - st_tile_st) / 1048576.0 / (s_frame - st_frame),
-                    (double)(s_tile_big - st_tile_big) / (s_frame - st_frame));
+                    (double)(s_tile_big - st_tile_big) / (s_frame - st_frame),
+                    (double)(s_dl_nodepth - st_dl_nodepth) / (s_frame - st_frame),
+                    (double)(s_dl_restarts - st_dl_restarts) / (s_frame - st_frame),
+                    (double)(s_ce_refresh - st_ce_refresh) / (s_frame - st_frame));
             st_cl_passes = s_cl_passes;
             st_cl_folded = s_cl_folded;
             st_hoist = s_hoist_up;
@@ -5224,6 +5486,9 @@ static void vk_flip(void)
             st_tile_ld = s_tile_ld;
             st_tile_st = s_tile_st;
             st_tile_big = s_tile_big;
+            st_dl_nodepth = s_dl_nodepth;
+            st_dl_restarts = s_dl_restarts;
+            st_ce_refresh = s_ce_refresh;
             s_st_draws = s_st_calls = s_st_inst = 0;
             st_frame = s_frame;
         }
@@ -5291,8 +5556,9 @@ static void vk_flip(void)
     end_rendering();
     s_rt = NULL;
     s_rt_depth = NULL;
+    s_last_col = 0;                     /* the depth predictor's "pass before" restarts */
     if (s && s_drew_any && dump_every && ((s_frame % (uint32_t)dump_every) == 0
-                                          || ((s_inst_alt || s_mips_alt || s_bias_alt) && s_frame % (uint32_t)dump_every == 1))) {
+                                          || ((s_inst_alt || s_mips_alt || s_bias_alt || s_ce_mode == 2 || s_dl_mode == 2 || s_cd_mode == 2) && s_frame % (uint32_t)dump_every == 1))) {
         char path[320];
         snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
         dump_surface(s, path);
@@ -5499,7 +5765,7 @@ static void vk_flip(void)
         /* Always-on 10 s line: where do the executor's flips go (submit
          * and present are where MoltenVK may wait for a drawable)? */
         static uint64_t win_start, sub_sum, sub_max, pre_sum, pre_max;
-        static uint32_t flips, npre, sub_base, reb_base, cl_p_base, cl_f_base, ho_base, in_base, tb_base;
+        static uint32_t flips, npre, sub_base, reb_base, cl_p_base, cl_f_base, ho_base, in_base, tb_base, dn_base, dr_base;
         static uint64_t tl_base, ts_base;
         uint64_t now = hz_now();
         if (!win_start) {
@@ -5537,14 +5803,18 @@ static void vk_flip(void)
                         "load-clear passes/frame %.1f, clears folded/frame %.1f, "
                         "hoisted uploads/frame %.1f, inline uploads/frame %.1f, "
                         "mem left %llu MB, tile load %.1f MB/frame, tile store %.1f MB/frame, "
-                        "full-size passes/frame %.1f\n",
+                        "full-size passes/frame %.1f, no-depth passes with zeta/frame %.1f, "
+                        "depth restarts/frame %.1f\n",
                         s_ios_passes / nf, s_ios_up_splits / nf, s_ios_lay_splits / nf,
                         s_ios_uploads / nf, s_ios_up_bytes / 1024.0 / nf,
                         (s_cl_passes - cl_p_base) / nf, (s_cl_folded - cl_f_base) / nf,
                         (s_hoist_up - ho_base) / nf, (s_inline_up - in_base) / nf, mem_mb,
                         (s_tile_ld - tl_base) / 1048576.0 / nf,
                         (s_tile_st - ts_base) / 1048576.0 / nf,
-                        (s_tile_big - tb_base) / nf);
+                        (s_tile_big - tb_base) / nf,
+                        (s_dl_nodepth - dn_base) / nf, (s_dl_restarts - dr_base) / nf);
+                dn_base = s_dl_nodepth;
+                dr_base = s_dl_restarts;
                 cl_p_base = s_cl_passes;
                 cl_f_base = s_cl_folded;
                 ho_base = s_hoist_up;
