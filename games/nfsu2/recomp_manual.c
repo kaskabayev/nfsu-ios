@@ -600,29 +600,34 @@ static void swap_pre(uint32_t slot)
  * the call at 0x0018A735 has a fixed step and is left alone) and hands the
  * game an even one instead. The dt is the float at [esp + 4], seconds,
  * cdecl; the caller only pops it.
- *   k     the median of real_dt / V over the last 8 iterations, rounded,
- *         at least 1 (V = 1/60 s). 1 at 60 fps, 2 at a steady 30 fps.
+ *   avg   the mean of real_dt / V over the last 8 iterations, without the
+ *         longest and the shortest one (V = 1/60 s). A median is wrong
+ *         here: at 30 fps the game often runs a long iteration (3.9 V) and
+ *         a quick one (0.1 V) in a pair. With four pairs in the ring the
+ *         upper median is 3.9 V, but the mean is 2 V.
+ *   k     avg, rounded, at least 1. 1 at 60 fps, 2 at a steady 30 fps.
  *   base  k * V.
  *   debt  the sum of real_dt - used_dt. One V is paid back only when the
- *         debt would pass 1.5 V: one more V when behind, one less when
- *         ahead (never under V). A late iteration followed by a quick one
- *         (1.9 V, 0.1 V) comes out as V, V.
- * The real dt goes through unchanged, with the debt and the median cleared,
+ *         debt would pass (k + 0.5) V: one more V when behind, one less
+ *         when ahead (never under V). A late iteration followed by a quick
+ *         one (1.9 V, 0.1 V at 60 fps; 3.9 V, 0.1 V at 30 fps) comes out
+ *         as k V, k V.
+ * The real dt goes through unchanged, with the debt and the ring cleared,
  * when it is above the game's step cap (at most 6 V: a load hitch, the app
  * parked), when the game's floor (0x428EE8) is above 1/60 (cutscene:
  * the NIS plays at 30 fps) or when the game runs its 50 Hz table (0x3A4C50 =
- * 0). It also goes through, with the debt kept, while the median is under
+ * 0). It also goes through, with the debt kept, while the average is under
  * 0.75 V: frames much faster than 60 fps, where a step of V would run the
  * game fast. A debt that cannot be paid (k = 1 and ahead, or the step at its
- * cap) is cut to 1.5 V.
+ * cap) is cut to (k + 0.5) V.
  *
  * NFSU2_DT_SMOOTH=0 hands the game its own dt as before. The pure step is
  * between the markers; tools or tests may extract it. */
 /* DT_SMOOTH_BEGIN */
 #define DT_V        (1.0f / 60.0f)
-#define DT_SM_RING  8                   /* iterations the median looks at */
+#define DT_SM_RING  8                   /* iterations the average looks at */
 #define DT_SM_HITCH 6.0f                /* longest smoothed dt, in V */
-#define DT_SM_FAST  0.75f               /* median under this (in V): no smoothing */
+#define DT_SM_FAST  0.75f               /* average under this (in V): no smoothing */
 
 typedef struct {
     float ratio[DT_SM_RING];            /* real_dt / V of the last iterations */
@@ -642,13 +647,13 @@ static void dt_smooth_reset(dt_smooth_t *s)
  * takes (seconds); hold: pass the real dt (cutscene, other time table). */
 static float dt_smooth_step(dt_smooth_t *s, float real, float limit, int hold)
 {
-    float sorted[DT_SM_RING], med, base, used;
-    double pend, v = DT_V;
-    int i, j, k, unpaid = 0;
+    float lo, hi, sum, avg, base, used;
+    double pend, thr, v = DT_V;
+    int i, k, unpaid = 0;
 
     if (limit > DT_SM_HITCH * DT_V)
         limit = DT_SM_HITCH * DT_V;
-    if (hold || !(real > 0.0f) || real > limit) {
+    if (hold || !(real >= 0.0f) || real > limit) {
         dt_smooth_reset(s);
         return real;
     }
@@ -656,27 +661,29 @@ static float dt_smooth_step(dt_smooth_t *s, float real, float limit, int hold)
     s->head = (s->head + 1) % DT_SM_RING;
     if (s->n < DT_SM_RING)
         s->n++;
-    for (i = 0; i < s->n; i++) {        /* insertion sort, n <= 8 */
+    lo = hi = sum = s->ratio[0];
+    for (i = 1; i < s->n; i++) {
         float x = s->ratio[i];
-        for (j = i; j > 0 && sorted[j - 1] > x; j--)
-            sorted[j] = sorted[j - 1];
-        sorted[j] = x;
+        sum += x;
+        if (x < lo) lo = x;
+        if (x > hi) hi = x;
     }
-    med = sorted[s->n / 2];
-    if (med < DT_SM_FAST)
+    avg = s->n > 2 ? (sum - lo - hi) / (float)(s->n - 2) : sum / (float)s->n;
+    if (avg < DT_SM_FAST)
         return real;                    /* used = real: the debt stays */
-    k = (int)(med + 0.5f);
+    k = (int)(avg + 0.5f);
     if (k < 1)
         k = 1;
     base = (float)(k * v);
     used = base;
+    thr = (k + 0.5) * v;
     pend = s->debt + real - base;
-    if (pend > 1.5 * v) {
+    if (pend > thr) {
         if (base + v <= limit)
             used = (float)(base + v);
         else
             unpaid = 1;
-    } else if (pend < -1.5 * v) {
+    } else if (pend < -thr) {
         if (k > 1)
             used = (float)(base - v);
         else
@@ -686,7 +693,7 @@ static float dt_smooth_step(dt_smooth_t *s, float real, float limit, int hold)
         s->fixes++;
     s->debt += (double)real - used;
     if (unpaid) {                       /* cannot go further: forgive the rest */
-        s->debt = s->debt > 0.0 ? 1.5 * v : -1.5 * v;
+        s->debt = s->debt > 0.0 ? thr : -thr;
     }
     if (fabs(s->debt) > s->max_debt)
         s->max_debt = fabs(s->debt);
@@ -866,7 +873,7 @@ static void dt_hist(void)
  * does) and put back when it ends. The time floor is not touched. No forcing
  * while the heat cap is on or the game's floor is above 1/60 (cutscene: the
  * NIS plays at 30 fps). The smooth time step starts over at each change of
- * the rate, so its median does not run behind the new rate. Forcing stops
+ * the rate, so its average does not run behind the new rate. Forcing stops
  * when one stretch runs past 30 s (no measured load comes near it; a stream
  * that never pauses, as free roam could be, is not a loading screen) and
  * comes back only after a stretch with no job.
