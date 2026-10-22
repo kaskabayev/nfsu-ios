@@ -31,6 +31,7 @@
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
+#include "state.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -870,9 +871,16 @@ static void dt_hist(void)
  * that never pauses, as free roam could be, is not a loading screen) and
  * comes back only after a stretch with no job.
  *
+ * No forcing while the game is in a race (gameflow 6, state.h). In a race
+ * the track streams in bursts of about 10 jobs every 5 s; on an iPhone each
+ * burst forced about 10 swaps at every vblank and reset the smooth time
+ * step, which showed as small speed-ups. The race loading screen is not
+ * gameflow 6, so it is still forced. Bursts in a race are still logged.
+ *
  * RECOMP_LOAD_FAST=0 only logs. RECOMP_PRESENT_INTERVAL=1 already presents
  * every vblank and only logs. One line per load:
- *   [load] <s> s, <frames> frames, <kicks> loader kicks, fast on|off */
+ *   [load] <s> s, <frames> frames, <kicks> loader kicks, fast on|off,
+ *   gameflow <n at the start of the stretch> */
 extern void sub_00253AD5_gen(void);
 
 #define LOAD_RING   10                  /* swaps the rule looks at */
@@ -904,11 +912,12 @@ static void load_swap(uint32_t slot)
     static unsigned swaps, forced;
     static unsigned long total;
     static int active, forcing, capped;
+    static unsigned gf0;                /* gameflow when the stretch started */
     static double prev;
     load_swap_t cur;
     struct timespec ts;
     double now;
-    unsigned i, n = 0;
+    unsigned i, n = 0, gf = 0;
     int want, fast = load_fast_wanted();
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -928,14 +937,15 @@ static void load_swap(uint32_t slot)
         active = 1;
         forced = 0;
         capped = 0;
+        nfsu2_state_words(&gf0, NULL, NULL);
         first = cur;
         for (i = 0; i < LOAD_RING; i++)
             if (ring[i].kicks && ring[i].swap < first.swap)
                 first = ring[i];
     } else if (active && n == 0) {
-        fprintf(stderr, "[load] %.1f s, %u frames, %lu loader kicks, fast %s\n",
+        fprintf(stderr, "[load] %.1f s, %u frames, %lu loader kicks, fast %s, gameflow %u\n",
                 last.t1 - first.t0, last.swap - first.swap + 1,
-                last.total - first.total + first.kicks, forced ? "on" : "off");
+                last.total - first.total + first.kicks, forced ? "on" : "off", gf0);
         active = 0;
     }
     if (active && !capped && now - first.t0 > LOAD_MAX_S) {
@@ -943,8 +953,9 @@ static void load_swap(uint32_t slot)
         fprintf(stderr, "[load] still loading after %.0f s: back to the game's own rate\n", LOAD_MAX_S);
     }
 
-    want = active && !capped && fast && !swap_interval_wanted() && !xbox_power_hot_cap()
-           && dt_f32(MEM32(0x428EE8u)) <= DT_60_EPS;
+    nfsu2_state_words(&gf, NULL, NULL);
+    want = active && !capped && fast && gf != 6 && !swap_interval_wanted()
+           && !xbox_power_hot_cap() && dt_f32(MEM32(0x428EE8u)) <= DT_60_EPS;
     if (want) {
         force_interval(slot);
         forced += s_forced;             /* 0 while the game's value is already every vblank */
