@@ -1036,6 +1036,98 @@ static int late_wait_wanted(void)
     return v;
 }
 
+/* ── Car model LOD ───────────────────────────────────────────
+ *
+ * The car renderers pick a model LOD (A..D) from the car's size on screen:
+ * sub_00098370 gives a radius-3 sphere's size in guest pixels, and the LOD
+ * steps down while that size is below the next entry of a table that ends
+ * in 0.0 -- 120/45/20 at 0x35EBA4 for sub_0020BC50 (the player and the
+ * racers) and 80/40/20 at 0x35EBB4 for sub_00204D60, the path the car list
+ * walker sub_002106F0 takes when [car+0x14]+4 is 3 (not identified). Those are 640x480 pixels: at render
+ * scale s one LOD step covers s times the screen pixels it did on the Xbox,
+ * so the model switch is easier to see. The entries are divided by s * k
+ * (NFSU2_CAR_LOD=k, default 5, 0 = the game's tables), so each switch
+ * happens about s * k times farther away (the size goes as 1 / (distance -
+ * 3 m), so a little less near the car). The engine has no cross-fade: the
+ * switch moves farther away, it does not go away. NFSU2_CAR_LOD_AB=1 gives
+ * the game's tables on every other frame (A/B dumps). The debug LOD
+ * overrides at 0x3CC644/0x3CC648 (-1) stay as they are: they would also
+ * force LOD A in the views that start at LOD B.
+ */
+#define CAR_LOD_RACER   0x35EBA4u
+#define CAR_LOD_TRAFFIC 0x35EBB4u
+#define CAR_LOD_DEFAULT 5.0
+#define CAR_LOD_LOG     4               /* table change lines, at most */
+
+#ifdef NFSU2_VULKAN
+extern volatile int nv2a_vk_scale_pct;
+#endif
+
+static double car_lod_scale(void)
+{
+    static double g = -1.0;
+#ifdef NFSU2_VULKAN
+    if (nv2a_vk_scale_pct >= 50)
+        return nv2a_vk_scale_pct / 100.0;
+#endif
+    if (g < 0.0) {
+        const char *e = getenv("RECOMP_GL_SCALE");
+        g = e ? strtod(e, NULL) : 1.0;
+        if (!(g > 0.0)) g = 1.0;
+        g = g < 0.5 ? 0.5 : g > 4.0 ? 4.0 : g;
+    }
+    return g;
+}
+
+/* Writes both tables before each frame: the Resolution Scale row can change. */
+static void car_lod_apply(void)
+{
+    static const float racer[3] = { 120.0f, 45.0f, 20.0f };
+    static const float traffic[3] = { 80.0f, 40.0f, 20.0f };
+    static double k = -1.0;
+    static int ab;
+    static unsigned frame, logged;
+    static float last;
+    float d;
+    int i;
+
+    if (k < 0.0) {
+        const char *e = getenv("NFSU2_CAR_LOD");
+        k = e && *e ? strtod(e, NULL) : CAR_LOD_DEFAULT;
+        if (!(k >= 0.0)) k = CAR_LOD_DEFAULT;
+        if (k > 16.0) k = 16.0;
+        e = getenv("NFSU2_CAR_LOD_AB");
+        ab = e && *e == '1';
+        for (i = 0; i < 3; i++)
+            if (MEMF(CAR_LOD_RACER + 4u * i) != racer[i] ||
+                MEMF(CAR_LOD_TRAFFIC + 4u * i) != traffic[i])
+                k = 0.0;
+        if (MEMF(CAR_LOD_RACER + 12u) != 0.0f || MEMF(CAR_LOD_TRAFFIC + 12u) != 0.0f)
+            k = 0.0;
+        if (k == 0.0)
+            fprintf(stderr, "[lod] car LOD tables left as they are (NFSU2_CAR_LOD=0 or other values)\n");
+        last = 1.0f;
+    }
+    if (k == 0.0)
+        return;
+    d = (float)(car_lod_scale() * k);
+    if (d < 1.0f || (ab && (frame++ & 1u)))
+        d = 1.0f;
+    for (i = 0; i < 3; i++) {
+        MEMF(CAR_LOD_RACER + 4u * i) = racer[i] / d;
+        MEMF(CAR_LOD_TRAFFIC + 4u * i) = traffic[i] / d;
+    }
+    if (d != last && logged < CAR_LOD_LOG) {
+        logged++;
+        fprintf(stderr, "[lod] car LOD switches %.2fx farther (scale %.2f, NFSU2_CAR_LOD=%g%s): "
+                "sizes %.1f/%.1f/%.1f and %.1f/%.1f/%.1f px\n",
+                d, car_lod_scale(), k, ab ? ", A/B" : "",
+                MEMF(CAR_LOD_RACER), MEMF(CAR_LOD_RACER + 4u), MEMF(CAR_LOD_RACER + 8u),
+                MEMF(CAR_LOD_TRAFFIC), MEMF(CAR_LOD_TRAFFIC + 4u), MEMF(CAR_LOD_TRAFFIC + 8u));
+    }
+    last = d;
+}
+
 /* Runs one generated swap with the slot as above. */
 static void swap_gen(uint32_t slot, void (*gen)(void))
 {
@@ -1063,6 +1155,7 @@ void sub_002EB4B0(void)
     unimpl_tick();
     dt_hist();
     load_swap(0x2F76FCu);
+    car_lod_apply();
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
     swap_gen(0x2F76FCu, sub_002EB4B0_gen);
@@ -1073,6 +1166,7 @@ void sub_002EB6A0(void)
     unimpl_tick();
     dt_hist();
     load_swap(0x2F76FCu);
+    car_lod_apply();
     if (swap_interval_wanted())
         swap_pre(0x2F76FCu);
     swap_gen(0x2F76FCu, sub_002EB6A0_gen);

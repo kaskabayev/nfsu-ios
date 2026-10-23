@@ -4831,6 +4831,7 @@ static struct {
 } s_pend;
 static int s_inst_on = -1, s_inst_alt;
 static uint32_t s_st_draws, s_st_calls, s_st_inst;
+static uint64_t s_st_verts, s_st_idx;
 
 static void pend_flush(void)
 {
@@ -4981,6 +4982,8 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
                 s_inst_on ? "on" : "off", s_ubo_range, (unsigned)s_ubo_align);
     }
     s_st_draws++;
+    s_st_verts += b->vertex_count;
+    s_st_idx += b->index_count;
     {
         int changed = regs_changed(r);
         if (pend_append(b, changed))
@@ -5462,9 +5465,12 @@ static void vk_flip(void)
             st = e && *e == '1';
         }
         if (st && s_frame - st_frame >= 300) {
-            fprintf(stderr, "[vk] per frame: %u draws -> %u draw calls (%u instances appended)\n",
+            fprintf(stderr, "[vk] per frame: %u draws -> %u draw calls (%u instances appended), "
+                    "%llu vertices, %llu indices\n",
                     s_st_draws / (s_frame - st_frame), s_st_calls / (s_frame - st_frame),
-                    s_st_inst / (s_frame - st_frame));
+                    s_st_inst / (s_frame - st_frame),
+                    (unsigned long long)(s_st_verts / (s_frame - st_frame)),
+                    (unsigned long long)(s_st_idx / (s_frame - st_frame)));
             fprintf(stderr, "[vk] per frame: %.2f load-clear passes, %.2f clears folded, "
                     "%.2f uploads hoisted, %.2f inline\n",
                     (double)(s_cl_passes - st_cl_passes) / (s_frame - st_frame),
@@ -5490,6 +5496,7 @@ static void vk_flip(void)
             st_dl_restarts = s_dl_restarts;
             st_ce_refresh = s_ce_refresh;
             s_st_draws = s_st_calls = s_st_inst = 0;
+            s_st_verts = s_st_idx = 0;
             st_frame = s_frame;
         }
     }
